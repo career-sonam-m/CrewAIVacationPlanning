@@ -1,5 +1,6 @@
 langchain-openai
-crewai[tools]
+crewai[tools]==0.28.8
 python-dotenv
 streamlit
 tavily-python
+pydantic==1.10.13
