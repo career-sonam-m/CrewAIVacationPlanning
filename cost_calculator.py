@@ -9,8 +9,17 @@ This module implements:
 
 from typing import Type
 from pydantic import BaseModel, Field
-from crewai.tools import BaseTool
 import streamlit as st
+
+try:
+    from crewai.tools import BaseTool
+except ImportError:
+    try:
+        from crewai.tools.tool_calling import BaseTool
+    except ImportError:
+        class BaseTool:
+            """Fallback for CrewAI versions that no longer expose BaseTool at this import path."""
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +178,15 @@ def render_cost_calculator():
     st.markdown("*Enter your estimated costs below for an instant itemized breakdown and grand total.*")
     st.markdown("")
 
+    # Treat the planner's extracted budget as the source of truth whenever a new main-page plan arrives.
+    if "plan_result" in st.session_state and not st.session_state.get("calc_synced_with_plan", False):
+        plan = st.session_state.get("plan_result", {})
+        try:
+            st.session_state.update(sync_plan_to_calculator(plan))
+        except Exception:
+            pass
+        st.session_state["calc_synced_with_plan"] = True
+
     inp_col, res_col = st.columns([1, 1.4], gap="large")
 
     with inp_col:
@@ -176,8 +194,45 @@ def render_cost_calculator():
         num_adults   = st.number_input("Adults",   min_value=1, max_value=20, value=2, key="calc_adults")
         num_children = st.number_input("Children", min_value=0, max_value=20, value=0, key="calc_children")
         num_days     = st.number_input("Trip Duration (days)", min_value=1, max_value=180, value=7, key="calc_days")
-        currency_sym = st.text_input("Currency Symbol", value="₹", placeholder="₹, €, £, ¥, $", key="calc_currency",
-                                     help="Enter the symbol for your destination currency")
+        # Currency dropdown with common world currencies
+        currency_options = [
+            "$ - USD (US Dollar)",
+            "€ - EUR (Euro)",
+            "£ - GBP (British Pound)",
+            "₹ - INR (Indian Rupee)",
+            "¥ - JPY (Japanese Yen)",
+            "¥ - CNY (Chinese Yuan)",
+            "A$ - AUD (Australian Dollar)",
+            "C$ - CAD (Canadian Dollar)",
+            "CHF - CHF (Swiss Franc)",
+            "₩ - KRW (South Korean Won)",
+            "S$ - SGD (Singapore Dollar)",
+            "R$ - BRL (Brazilian Real)",
+            "฿ - THB (Thai Baht)",
+            "₺ - TRY (Turkish Lira)",
+            "د.إ - AED (UAE Dirham)",
+            "RM - MYR (Malaysian Ringgit)",
+            "₱ - PHP (Philippine Peso)",
+            "kr - SEK (Swedish Krona)",
+            "zł - PLN (Polish Zloty)",
+            "R - ZAR (South African Rand)",
+        ]
+        # Prefer any previously-selected currency stored in session state so tabs stay in sync
+        initial_currency = st.session_state.get("calc_currency_select")
+        if initial_currency and initial_currency in currency_options:
+            initial_index = currency_options.index(initial_currency)
+        else:
+            initial_index = 0
+
+        selected_currency = st.selectbox(
+            "Currency",
+            options=currency_options,
+            index=initial_index,
+            key="calc_currency_select",
+            help="Select the currency for your destination"
+        )
+        # Extract just the symbol from the selected option (everything before ' - ')
+        currency_sym = selected_currency.split(" - ")[0].strip()
 
         # Track currency switch to update default values in session state
         if "calc_prev_currency" not in st.session_state:
@@ -192,35 +247,50 @@ def render_cost_calculator():
         default_activities = 15000.0 if is_high_value_currency else 200.0
         default_transport  = 6000.0  if is_high_value_currency else 80.0
 
+        # When returning from the main planner, prefer values already in session state
+        flight_default = st.session_state.get("calc_flight", default_flight)
+        hotel_default = st.session_state.get("calc_hotel", default_hotel)
+        food_default = st.session_state.get("calc_food", default_food)
+        activities_default = st.session_state.get("calc_activities", default_activities)
+        transport_default = st.session_state.get("calc_transport", default_transport)
+        misc_default = st.session_state.get("calc_misc", 0.0)
+
         if st.session_state.calc_prev_currency != currency_sym:
             st.session_state.calc_prev_currency = currency_sym
-            st.session_state.calc_flight = default_flight
-            st.session_state.calc_hotel = default_hotel
-            st.session_state.calc_food = default_food
-            st.session_state.calc_activities = default_activities
-            st.session_state.calc_transport = default_transport
-            st.session_state.calc_misc = 0.0
+            # Only overwrite inputs if they weren't explicitly set by the planner run
+            if "calc_flight" not in st.session_state:
+                st.session_state.calc_flight = default_flight
+            if "calc_hotel" not in st.session_state:
+                st.session_state.calc_hotel = default_hotel
+            if "calc_food" not in st.session_state:
+                st.session_state.calc_food = default_food
+            if "calc_activities" not in st.session_state:
+                st.session_state.calc_activities = default_activities
+            if "calc_transport" not in st.session_state:
+                st.session_state.calc_transport = default_transport
+            if "calc_misc" not in st.session_state:
+                st.session_state.calc_misc = 0.0
             st.rerun()
 
         st.markdown("#### 💰 Cost Inputs")
         flight_pp    = st.number_input(f"Flight — round-trip per person ({currency_sym})",
-                                       min_value=0.0, value=default_flight, step=10.0 if not is_high_value_currency else 1000.0, key="calc_flight",
-                                       help="Economy round-trip cost per traveler")
+                           min_value=0.0, value=flight_default, step=10.0 if not is_high_value_currency else 1000.0, key="calc_flight",
+                           help="Economy round-trip cost per traveler")
         hotel_pn     = st.number_input(f"Hotel — per night, all rooms ({currency_sym})",
-                                       min_value=0.0, value=default_hotel, step=10.0 if not is_high_value_currency else 500.0, key="calc_hotel",
-                                       help="Total room cost per night for the whole party")
+                           min_value=0.0, value=hotel_default, step=10.0 if not is_high_value_currency else 500.0, key="calc_hotel",
+                           help="Total room cost per night for the whole party")
         food_ppd     = st.number_input(f"Food — per person per day ({currency_sym})",
-                                       min_value=0.0, value=default_food, step=5.0 if not is_high_value_currency else 100.0, key="calc_food",
-                                       help="Average daily food spend per traveler")
+                           min_value=0.0, value=food_default, step=5.0 if not is_high_value_currency else 100.0, key="calc_food",
+                           help="Average daily food spend per traveler")
         activities   = st.number_input(f"Activities & Attractions — total ({currency_sym})",
-                                       min_value=0.0, value=default_activities, step=10.0 if not is_high_value_currency else 500.0, key="calc_activities",
-                                       help="Total tickets, tours, and experiences for all travelers")
+                           min_value=0.0, value=activities_default, step=10.0 if not is_high_value_currency else 500.0, key="calc_activities",
+                           help="Total tickets, tours, and experiences for all travelers")
         transport    = st.number_input(f"Local Transport — total ({currency_sym})",
-                                       min_value=0.0, value=default_transport, step=10.0 if not is_high_value_currency else 500.0, key="calc_transport",
-                                       help="Taxis, metro passes, trains for the whole trip")
+                           min_value=0.0, value=transport_default, step=10.0 if not is_high_value_currency else 500.0, key="calc_transport",
+                           help="Taxis, metro passes, trains for the whole trip")
         misc         = st.number_input(f"Miscellaneous / Shopping ({currency_sym})",
-                                       min_value=0.0, value=0.0, step=10.0 if not is_high_value_currency else 500.0, key="calc_misc",
-                                       help="Optional extra spending budget")
+                           min_value=0.0, value=misc_default, step=10.0 if not is_high_value_currency else 500.0, key="calc_misc",
+                           help="Optional extra spending budget")
         contingency_pct = st.slider("Contingency Buffer (%)", min_value=5, max_value=25, value=12, key="calc_cont",
                                     help="Extra buffer for unexpected costs, added on top of subtotal")
 
@@ -362,3 +432,57 @@ def render_cost_calculator():
             mime="text/plain",
             key="calc_download"
         )
+
+
+def sync_plan_to_calculator(plan_data: dict) -> dict:
+    """Extract budget data from plan and sync it to calculator session state.
+
+    Args:
+        plan_data: Dictionary containing the vacation plan with extracted_budget
+
+    Returns:
+        Dictionary of calculator state values to update
+    """
+    if not plan_data or not plan_data.get("extracted_budget"):
+        return {}
+
+    eb = plan_data["extracted_budget"]
+    sym = plan_data.get("currency_symbol", "$")
+
+    currency_map = {
+        "$": "$ - USD (US Dollar)",
+        "€": "€ - EUR (Euro)",
+        "£": "£ - GBP (British Pound)",
+        "₹": "₹ - INR (Indian Rupee)",
+        "¥": "¥ - JPY (Japanese Yen)",
+        "A$": "A$ - AUD (Australian Dollar)",
+        "C$": "C$ - CAD (Canadian Dollar)",
+        "CHF": "CHF - CHF (Swiss Franc)",
+        "₩": "₩ - KRW (South Korean Won)",
+        "S$": "S$ - SGD (Singapore Dollar)",
+        "R$": "R$ - BRL (Brazilian Real)",
+        "฿": "฿ - THB (Thai Baht)",
+        "₺": "₺ - TRY (Turkish Lira)",
+        "د.إ": "د.إ - AED (UAE Dirham)",
+        "RM": "RM - MYR (Malaysian Ringgit)",
+        "₱": "₱ - PHP (Philippine Peso)",
+        "kr": "kr - SEK (Swedish Krona)",
+        "zł": "zł - PLN (Polish Zloty)",
+        "R": "R - ZAR (South African Rand)",
+    }
+
+    currency_select = currency_map.get(sym, "$ - USD (US Dollar)")
+
+    return {
+        "calc_flight": float(eb.get("flight_pp", 0.0)),
+        "calc_hotel": float(eb.get("hotel_pn", 0.0)),
+        "calc_food": float(eb.get("food_ppd", 0.0)),
+        "calc_activities": float(eb.get("activities", 0.0)),
+        "calc_transport": float(eb.get("transport", 0.0)),
+        "calc_misc": float(eb.get("misc", 0.0)),
+        "calc_adults": int(eb.get("num_adults", 2)),
+        "calc_children": int(eb.get("num_children", 0)),
+        "calc_days": int(eb.get("num_days", 7)),
+        "calc_currency_select": currency_select,
+        "calc_prev_currency": sym,
+    }
