@@ -6,7 +6,6 @@ sidebar configurations, and event handlers. It delegates core business logic
 to the other modular files:
 - utils.py: Date parsing, defaults, and timeline checklist utilities.
 - crew_planner.py: Multi-agent orchestration using CrewAI and validation logic.
-- cost_calculator.py: Interactive math-based cost calculator component.
 
 Run this app using:
     streamlit run app.py
@@ -37,7 +36,6 @@ from crew_planner import (
     validate_destination_quick,
     run_vacation_planner
 )
-from cost_calculator import render_cost_calculator, sync_plan_to_calculator
 
 # Streamlit Page UI
 # ----------------------
@@ -195,10 +193,9 @@ if __name__ == "__main__":
     
     st.sidebar.markdown("### 🤖 CrewAI Multi-Agent Team")
     st.sidebar.markdown("""
-    This app orchestrates **5 specialized AI agents** operating in parallel and sequential workflows:
+    This app orchestrates **4 specialized AI agents** operating in sequential and concurrent workflows:
 
-    - ✈️ **Flight & Transport Specialist**: Real-time web search for flight fares & local transport options.
-    - 🏨 **Accommodation & Attractions Specialist**: Real-time web search for lodging rates & top attractions.
+    - 🔍 **Research Specialist**: Real-time web search for flight tiers, lodging rates, transport, & attractions.
     - 📅 **Itinerary Planner**: Crafts detailed day-by-day schedules.
     - 💰 **Financial Coordinator**: Calculates local currency budgets & 5 money saving tips.
     - 📋 **Trip Director**: Merges all agent outputs into a polished final master deliverable.
@@ -225,12 +222,8 @@ if __name__ == "__main__":
     # Setup default dates
     default_demo_dates = generate_default_demo_dates()
 
-    # Top-level tabs: Vacation Planner vs Cost Calculator
-    tab_planner, tab_calc = st.tabs(["🌴 Vacation Planner", "🧮 Cost Calculator"])
-
-    with tab_planner:
-        # Plan parameters section
-        col1, col2 = st.columns([1.2, 1.7])
+    # Plan parameters layout section
+    col1, col2 = st.columns([1.2, 1.7])
 
     with col1:
         st.markdown(render_section_header("Vacation Specifications", icon="📍", subtitle="Enter trip details"), unsafe_allow_html=True)
@@ -331,9 +324,6 @@ if __name__ == "__main__":
                     }
                 }
                 st.session_state.plan_result = demo_plan
-                # Mark calculator as needing to re-sync with the new demo plan
-                st.session_state["calc_synced_with_plan"] = False
-                st.session_state.update(sync_plan_to_calculator(demo_plan))
                 st.experimental_rerun()
         else:
             vacation_goal = f"Plan trip from {origin_city} to {destination_city}. {vacation_goal_input}" if origin_city else f"Plan trip to {destination_city}. {vacation_goal_input}"
@@ -394,9 +384,6 @@ if __name__ == "__main__":
                     destination_city=destination_city
                 )
                 st.session_state.plan_result = plan_data
-                # Signal calculator tab to sync its inputs from this fresh plan
-                st.session_state["calc_synced_with_plan"] = False
-                st.session_state.update(sync_plan_to_calculator(plan_data))
             except Exception as e:
                 st.error(f"An error occurred while running the planner: {e}")
 
@@ -434,9 +421,6 @@ if __name__ == "__main__":
                         destination_city=destination_city
                     )
                     st.session_state.plan_result = plan_data
-                    # Signal calculator tab to sync its inputs from this fresh plan
-                    st.session_state["calc_synced_with_plan"] = False
-                    st.session_state.update(sync_plan_to_calculator(plan_data))
                 except Exception as e:
                     st.error(f"An error occurred while running the planner: {e}")
 
@@ -473,7 +457,7 @@ if __name__ == "__main__":
                         f"✈️ **Recommended Flight**\n\n"
                         f"**Airline:** {airline}  \n"
                         f"**Route:** {route}  \n"
-                        f"**Cost:** {sym}{flight_cost:,.2f} per person"
+                        f"**Cost:** {sym}{flight_cost:,.2f} per person (round trip)"
                         f"{link_line}"
                     )
 
@@ -642,7 +626,3 @@ if __name__ == "__main__":
         else:
             st.info("👈 Enter specifications and click 'Generate Vacation Plan' or click 'Run Default Demo' to begin.")
             st.image("https://images.unsplash.com/photo-1488646953014-85cb44e25828?q=80&w=600&auto=format&fit=crop", use_container_width=True)
-
-    # Tab 2: Standalone Cost Calculator
-    with tab_calc:
-        render_cost_calculator()

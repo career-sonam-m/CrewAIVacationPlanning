@@ -2,8 +2,8 @@
 CrewAI Planner Orchestrator - CrewAI Vacation Planner
 
 This module defines the CrewAI multi-agent system including:
-- 5 specialized agents (Flight & Transport Specialist, Accommodation & Attractions Specialist, Itinerary Planner, Financial Coordinator, Trip Director)
-- 5 workflow tasks (Flight & Transport, Accommodation & Attractions [async], Itinerary [async], Budget [async], Coordination)
+- 4 specialized agents (Research Specialist, Itinerary Planner, Financial Coordinator, Trip Director)
+- 4 workflow tasks (Research, Itinerary [async], Budget [async], Coordination)
 - Custom TrackedTavilySearchTool with URL capture
 - Pre-flight destination validation (direct LLM call for speed)
 - Orchestrator function `run_vacation_planner(...)`
@@ -35,7 +35,210 @@ from pydantic import BaseModel, Field
 
 # Helper utilities & calculation tools
 from utils import get_currency_symbol, validate_and_adjust_dates
-from cost_calculator import CalculatorTool, TripCostCalculatorTool
+import ast
+import operator
+import re
+
+# ---------------------------------------------------------------------------
+# Core Calculation Engine (for agent and fallback tools)
+# ---------------------------------------------------------------------------
+
+def calculate_trip_budget(
+    num_adults: int,
+    num_children: int,
+    num_days: int,
+    flight_pp: float,
+    hotel_pn: float,
+    food_ppd: float,
+    activities: float = 0.0,
+    transport: float = 0.0,
+    misc: float = 0.0,
+    contingency_pct: float = 12.0,
+    currency_symbol: str = "₹"
+) -> dict:
+    """Core mathematical engine for calculating itemized trip budgets."""
+    total_travelers = max(1, num_adults + num_children)
+    flights_total = flight_pp * total_travelers
+    hotel_total = hotel_pn * num_days
+    food_total = food_ppd * total_travelers * num_days
+    subtotal = flights_total + hotel_total + food_total + activities + transport + misc
+    contingency_amt = subtotal * (contingency_pct / 100.0)
+    grand_total = subtotal + contingency_amt
+    per_person = grand_total / total_travelers if total_travelers > 0 else 0.0
+
+    return {
+        "total_travelers": total_travelers,
+        "num_adults": num_adults,
+        "num_children": num_children,
+        "num_days": num_days,
+        "flights_total": flights_total,
+        "hotel_total": hotel_total,
+        "food_total": food_total,
+        "activities": activities,
+        "transport": transport,
+        "misc": misc,
+        "subtotal": subtotal,
+        "contingency_amt": contingency_amt,
+        "contingency_pct": contingency_pct,
+        "grand_total": grand_total,
+        "per_person": per_person,
+        "currency_symbol": currency_symbol
+    }
+
+
+# ---------------------------------------------------------------------------
+# Safe arithmetic expression evaluator (no eval() or sandbox bypass)
+# ---------------------------------------------------------------------------
+
+_ALLOWED_BINOPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_ALLOWED_UNARYOPS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+_ALLOWED_FUNCS = {"abs": abs, "round": round, "min": min, "max": max}
+
+
+def _eval_ast_node(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
+        return _ALLOWED_BINOPS[type(node.op)](_eval_ast_node(node.left), _eval_ast_node(node.right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARYOPS:
+        return _ALLOWED_UNARYOPS[type(node.op)](_eval_ast_node(node.operand))
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _ALLOWED_FUNCS:
+        args = [_eval_ast_node(a) for a in node.args]
+        return _ALLOWED_FUNCS[node.func.id](*args)
+    raise ValueError("Unsupported or unsafe expression element")
+
+
+def safe_eval_expression(expression: str) -> float:
+    """Evaluate a plain arithmetic expression without using eval()/exec()."""
+    parsed = ast.parse(expression, mode="eval").body
+    return _eval_ast_node(parsed)
+
+
+# ---------------------------------------------------------------------------
+# CrewAI BaseTool Wrappers
+# ---------------------------------------------------------------------------
+
+class TripCostInput(BaseModel):
+    """Input parameters for calculating itemized trip budget."""
+    num_days: int = Field(..., description="Duration of the trip in days")
+    flight_pp: float = Field(default=0.0, description="Round-trip flight fare per person in local currency")
+    hotel_pn: float = Field(default=0.0, description="Total room cost per night for all rooms in local currency")
+    food_ppd: float = Field(default=0.0, description="Average daily food spend per person in local currency")
+    num_adults: int = Field(default=2, description="Number of adult travelers")
+    num_children: int = Field(default=0, description="Number of child travelers")
+    activities: float = Field(default=0.0, description="Total cost for all tickets, tours, and activities")
+    transport: float = Field(default=0.0, description="Total local transport cost (taxi, train, transit) for entire trip")
+    misc: float = Field(default=0.0, description="Optional extra or shopping budget")
+    contingency_pct: float = Field(default=12.0, description="Contingency buffer percentage (5-20%)")
+    currency_symbol: str = Field(default="₹", description="Currency symbol (e.g. $, €, ¥, ₹)")
+    flights: float = Field(default=0.0, description="Deprecated. Alias for flight_pp. Do not use.")
+    flight_route: str = Field(default="", description="Deprecated. Do not use.")
+    accommodation: float = Field(default=0.0, description="Deprecated. Alias for hotel_pn. Do not use.")
+    lodging: float = Field(default=0.0, description="Deprecated. Alias for hotel_pn. Do not use.")
+
+    class Config:
+        extra = "allow"
+
+
+class TripCostCalculatorTool(BaseTool):
+    """CrewAI-compatible tool for calculating precise itemized trip budgets using cost_calculator math engine."""
+    name: str = "Trip Budget Calculator"
+    description: str = (
+        "Calculates exact itemized travel budgets including flights, lodging, dining, "
+        "activities, local transit, subtotal, contingency, grand total, and per-person cost."
+    )
+    args_schema: Type[BaseModel] = TripCostInput
+
+    def _run(
+        self,
+        num_days: int,
+        flight_pp: float = 0.0,
+        hotel_pn: float = 0.0,
+        food_ppd: float = 0.0,
+        num_adults: int = 2,
+        num_children: int = 0,
+        activities: float = 0.0,
+        transport: float = 0.0,
+        misc: float = 0.0,
+        contingency_pct: float = 12.0,
+        currency_symbol: str = "₹",
+        flights: float = 0.0,
+        flight_route: str = "",
+        accommodation: float = 0.0,
+        lodging: float = 0.0,
+        **kwargs
+    ) -> str:
+        # Gracefully handle older model calls that pass flight totals into the wrong parameter name
+        f_pp = flight_pp if flight_pp > 0 else flights
+        h_pn = hotel_pn if hotel_pn > 0 else (accommodation if accommodation > 0 else lodging)
+        res = calculate_trip_budget(
+            num_adults=num_adults,
+            num_children=num_children,
+            num_days=num_days,
+            flight_pp=f_pp,
+            hotel_pn=h_pn,
+            food_ppd=food_ppd,
+            activities=activities,
+            transport=transport,
+            misc=misc,
+            contingency_pct=contingency_pct,
+            currency_symbol=currency_symbol
+        )
+        sym = res["currency_symbol"]
+        return (
+            f"=== Trip Budget Calculation Result ===\n"
+            f"Travelers: {res['total_travelers']} ({res['num_adults']} adults, {res['num_children']} children)\n"
+            f"Duration: {res['num_days']} days\n"
+            f"Flights: {sym}{res['flights_total']:,.2f} ({sym}{f_pp:,.2f} x {res['total_travelers']} travelers)\n"
+            f"Accommodation: {sym}{res['hotel_total']:,.2f} ({sym}{h_pn:,.2f} x {res['num_days']} nights)\n"
+            f"Food & Dining: {sym}{res['food_total']:,.2f} ({sym}{food_ppd:,.2f} x {res['total_travelers']}p x {res['num_days']}d)\n"
+            f"Activities: {sym}{res['activities']:,.2f}\n"
+            f"Transport: {sym}{res['transport']:,.2f}\n"
+            f"Miscellaneous: {sym}{res['misc']:,.2f}\n"
+            f"Subtotal: {sym}{res['subtotal']:,.2f}\n"
+            f"Contingency ({res['contingency_pct']}%): {sym}{res['contingency_amt']:,.2f}\n"
+            f"GRAND TOTAL: {sym}{res['grand_total']:,.2f}\n"
+            f"Per Person: {sym}{res['per_person']:,.2f}"
+        )
+
+
+class CalculatorInput(BaseModel):
+    """Input schema for the general arithmetic Calculator tool."""
+    expression: str = Field(..., description="Mathematical expression string to calculate (e.g. '150 * 5 + 400 + 120').")
+
+
+class CalculatorTool(BaseTool):
+    """CrewAI-compatible tool for general mathematical arithmetic."""
+    name: str = "Calculator"
+    description: str = (
+        "Useful for calculating travel budgets, multiplying daily rates by number of days or travelers, "
+        "summing category totals, and computing contingency percentages. "
+        "Input must be a mathematical expression like '150 * 5 + 400' or '2500 * 0.15'."
+    )
+    args_schema: Type[BaseModel] = CalculatorInput
+
+    def _run(self, expression: str) -> str:
+        """Safely evaluate a mathematical expression using an AST allowlist (no eval())."""
+        try:
+            clean_expr = expression.replace("$", "").replace("¥", "").replace("€", "").replace("₹", "").strip()
+            # Strip thousands-separator commas (e.g. "1,500" or "12,000.50") without breaking
+            # multi-arg calls like round(x, 2) or max(1,2,3) — only matches groups of exactly 3 digits.
+            clean_expr = re.sub(r'(?<=\d),(?=\d{3}(?!\d))', '', clean_expr)
+            result = safe_eval_expression(clean_expr)
+            return f"Result: {result}"
+        except Exception as e:
+            return f"Calculation error for '{expression}': {str(e)}"
 
 # Global mutable list that captures URLs fetched by Tavily during a planning run.
 # Cleared before each run so sources are always fresh for the current plan.
@@ -359,41 +562,20 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
         search_tools = [web_search_tool] if web_search_tool else []
         financial_tools = search_tools + [calculator_tool, trip_budget_calculator]
 
-        flight_transport_agent = Agent(
-            role="Flight & Transport Research Specialist",
+        research_agent = Agent(
+            role="Travel & Attractions Research Specialist",
             goal=(
-                f"Research flights and local transport for: {enhanced_goal}. "
+                f"Research comprehensive travel options for: {enhanced_goal}. "
                 f"FLIGHT ROUTE: {flight_route} (round-trip). "
-                f"Find flights with specific airline names and local transport options "
-                f"with pricing in local currency ({detected_currency}). "
-                f"Tailor all recommendations for the travel party: {enhanced_family}."
-            ),
-            backstory=(
-                "You are a seasoned travel researcher specializing in flights and ground transport. "
-                "You always research flights for the EXACT route specified, "
-                "naming specific airlines that operate on that route. "
-                "You always consider the composition of the travel party "
-                "when making recommendations — solo travelers get different suggestions than families with kids."
-            ),
-            tools=search_tools,
-            llm=llm,
-            verbose=False,
-            allow_delegation=False,
-            max_iter=default_max_iter,
-            max_execution_time=default_max_exec_time,
-        )
-
-        stay_attractions_agent = Agent(
-            role="Accommodation & Attractions Research Specialist",
-            goal=(
-                f"Research accommodations and top attractions for: {enhanced_goal}. "
-                f"Find accommodations and 10 must-visit attractions "
+                f"Find flights with specific airline names, accommodations, transport, and 10 must-visit attractions "
                 f"with pricing in local currency ({detected_currency}). "
                 f"Tailor all recommendations for the travel party: {enhanced_family}."
             ),
             backstory=(
                 "You are a seasoned travel researcher with deep expertise in global destinations. "
-                "You specialize in finding diverse accommodation options and hidden-gem attractions. "
+                "You specialize in finding diverse accommodation options, competitive flight deals, "
+                "and hidden-gem attractions. You always research flights for the EXACT route specified, "
+                "naming specific airlines that operate on that route. "
                 "You always consider the composition of the travel party "
                 "when making recommendations — solo travelers get different suggestions than families with kids."
             ),
@@ -469,9 +651,9 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
         # Flights/transport and accommodation/attractions are independent — running them as two
         # separate async subagent tasks lets them execute concurrently instead of one long serial task.
 
-        flight_transport_task = Task(
+        research_task = Task(
             description=(
-                f"Research flights and local transport for:\n"
+                f"Research travel options and top attractions for:\n"
                 f"Goal: {enhanced_goal}\n"
                 f"FLIGHT ROUTE: {flight_route} (round-trip)\n"
                 f"Dates: {enhanced_dates}\n"
@@ -490,32 +672,12 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "  * For EACH option: state airline name, whether direct or connecting, flight duration, "
                 "and estimated round-trip fare per person based on travel dates and seasonality\n"
                 "  * Calculate total flight cost for the whole party\n"
-                "- Local transport options with pricing:\n"
-                "  * Rail passes, car rental, ride-sharing and public transit costs\n\n"
-                f"Use the LOCAL CURRENCY ({detected_currency}) for all pricing.\n"
-                "If any option requires online bookings, flag it with 'ACTION REQUIRED'."
-            ),
-            expected_output=(
-                "A research report covering: 2 flight options with prices and airline names, "
-                f"and local transport options with costs — all in {detected_currency}."
-            ),
-            agent=flight_transport_agent,
-            async_execution=True,
-        )
-
-        stay_attractions_task = Task(
-            description=(
-                f"Research accommodations and top attractions for:\n"
-                f"Goal: {enhanced_goal}\n"
-                f"Dates: {enhanced_dates}\n"
-                f"{trip_duration_line}"
-                f"Travel party: {enhanced_family}\n"
-                f"Preferences: {preferences}\n\n"
-                "Provide DIVERSE and SPECIFIC recommendations:\n"
                 "- 2-3 accommodation types with SPECIFIC, UNIQUE hotels/properties:\n"
                 "  * Avoid generic chain hotels when possible\n"
                 "  * Provide options suitable for the composition of the party\n"
                 f"  * Estimate per-night rates in LOCAL CURRENCY ({detected_currency}) for dates specified\n"
+                "- Local transport options with pricing:\n"
+                "  * Rail passes, car rental, ride-sharing and public transit costs\n"
                 "- 10 must-visit attractions:\n"
                 "  * Attraction name, location, visit duration, cost per person in LOCAL CURRENCY\n"
                 f"  * IMPORTANT: If {enhanced_family} has NO children/kids, do NOT recommend child-centric attractions\n"
@@ -524,11 +686,11 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "If any option requires online bookings, flag it with 'ACTION REQUIRED'."
             ),
             expected_output=(
-                "A research report covering: accommodation recommendations with nightly rates "
+                "A comprehensive research report covering: flight options with prices, "
+                "accommodation recommendations with nightly rates, local transport options with costs, "
                 f"and 10 must-visit attractions with per-person pricing — all in {detected_currency}."
             ),
-            agent=stay_attractions_agent,
-            async_execution=True,
+            agent=research_agent,
         )
 
         itinerary_task = Task(
@@ -539,7 +701,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 f"{trip_duration_line}"
                 f"Travel party: {enhanced_family}\n"
                 f"Preferences: {preferences}\n\n"
-                "Use the research findings from the Research Specialists to inform your schedule.\n\n"
+                "Use the research findings from the Research Specialist to inform your schedule.\n\n"
                 "For each day list:\n"
                 "- Morning / Afternoon / Evening activities\n"
                 "- Estimated travel time between stops\n"
@@ -552,7 +714,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "activities, travel times between stops, and practical notes for the travel party."
             ),
             agent=itinerary_agent,
-            context=[flight_transport_task, stay_attractions_task],
+            context=[research_task],
             async_execution=True,
         )
 
@@ -567,7 +729,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 f"{trip_duration_line}"
                 f"Travel party: {enhanced_family}\n"
                 f"Preferences: {preferences}\n\n"
-                "Use the research findings from the Research Specialists.\n"
+                "Use the research findings from the Research Specialist.\n"
                 "CRITICAL: Use your Calculator tool for all math calculations (multiplication of rates, summing categories, contingency percentage).\n\n"
                 "FLIGHT COSTS:\n"
                 f"1. The flight route is: {flight_route} (round-trip). Use this EXACT route for pricing.\n"
@@ -601,7 +763,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "and a prominently displayed grand total with min/max range."
             ),
             agent=financial_agent,
-            context=[flight_transport_task, stay_attractions_task],
+            context=[research_task],
             async_execution=True,
         )
 
@@ -648,16 +810,16 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 f"All amounts in {detected_currency} with {currency_symbol} symbol."
             ),
             agent=coordination_agent,
-            context=[flight_transport_task, stay_attractions_task, itinerary_task, budget_task],
+            context=[research_task, itinerary_task, budget_task],
         )
 
         # --- Assemble and Run the CrewAI Crew ---
 
-        st.write("🗓️ **Step 3/3**: CrewAI agents researching, generating itinerary & budget concurrently, then compiling final plan...")
+        st.write("🗓️ **Step 3/3**: CrewAI agents generating itinerary & budget concurrently, then compiling final plan...")
 
         vacation_crew = Crew(
-            agents=[flight_transport_agent, stay_attractions_agent, itinerary_agent, financial_agent, coordination_agent],
-            tasks=[flight_transport_task, stay_attractions_task, itinerary_task, budget_task, coordination_task],
+            agents=[research_agent, itinerary_agent, financial_agent, coordination_agent],
+            tasks=[research_task, itinerary_task, budget_task, coordination_task],
             process=Process.sequential,
             llm=llm,
             cache=True,
@@ -680,26 +842,70 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                     result = result.replace(match.group(0), "").strip()
                 except Exception:
                     pass
+            # Construct highly-accurate dynamic search URL based on traveler specification cities and travel dates
+            # instead of using generic landing/cached pages which are not for the right dates.
+            precise_search_url = ""
+            try:
+                origin_p = origin_city.strip() if origin_city else ""
+                dest_p = destination_city.strip() if destination_city else ""
+                
+                # Try to parse start and end dates from enhanced_dates
+                start_date_str = ""
+                end_date_str = ""
+                if " to " in enhanced_dates:
+                    parts = enhanced_dates.split(" to ")
+                    start_date_str = parts[0].strip()
+                    end_date_str = parts[1].strip()
+                else:
+                    start_date_str = enhanced_dates.strip()
+                    end_date_str = start_date_str
+                
+                if origin_p and dest_p and start_date_str:
+                    # Clean up the names to extract city name without airport codes/parenthesis for cleaner travel URLs
+                    origin_clean = origin_p.split(",")[0].split("(")[0].strip()
+                    dest_clean = dest_p.split(",")[0].split("(")[0].strip()
+                    
+                    import urllib.parse
+                    # Generate a precise Google Flights travel search deep link using exact travel parameters
+                    query_term = f"Flights from {origin_clean} to {dest_clean} on {start_date_str} roundtrip returning {end_date_str}"
+                    encoded_query = urllib.parse.quote(query_term)
+                    precise_search_url = f"https://www.google.com/travel/flights?q={encoded_query}"
+            except Exception:
+                pass
+
             # If we successfully parsed an extracted_budget, try to annotate it with a source URL for key prices
             if extracted_budget and isinstance(extracted_budget, dict):
-                # Prefer any tracked Tavily source that looks like a flight booking site (makemytrip, cleartrip, skyscanner, kayak, momondo)
-                preferred_hosts = ["makemytrip.com", "cleartrip.com", "skyscanner.net", "skyscanner.com", "kayak.com", "momondo.com", "google.com"]
-                flight_src = None
-                for src in _active_search_sources:
-                    u = src.get("url", "") or ""
-                    for h in preferred_hosts:
-                        if h in u:
-                            flight_src = u
-                            break
-                    if flight_src:
-                        break
-                # Fallback: if no preferred host, pick first source that mentions flights
-                if not flight_src:
+                # Always use our dynamically constructed exact-travel-date search deep link as first-choice!
+                if precise_search_url:
+                    flight_src = precise_search_url
+                else:
+                    # Prefer any tracked Tavily source that looks like a reliable flight booking site.
+                    # Safe for BOTH domestic and international departure routes! 
+                    # Avoid matching localized regional crawlers (like /nepal/ templates unless target country is actually Nepal)
+                    preferred_hosts = ["makemytrip.com", "cleartrip.com", "skyscanner.net", "skyscanner.com", "kayak.com", "momondo.com", "google.com"]
+                    flight_src = None
                     for src in _active_search_sources:
-                        q = (src.get("query") or "").lower()
-                        if "flight" in q or "fare" in q or "flight" in (src.get("title") or "").lower():
-                            flight_src = src.get("url")
+                        u = src.get("url", "") or ""
+                        # Safeguard against wrong SEO routing unless Nepal is the actual target/origin
+                        if "/nepal/" in u and "nepal" not in (enhanced_goal.lower() + " " + preferences.lower()):
+                            continue
+                        for h in preferred_hosts:
+                            if h in u:
+                                flight_src = u
+                                break
+                        if flight_src:
                             break
+                    # Fallback: if no preferred host, pick first source that mentions flights
+                    if not flight_src:
+                        for src in _active_search_sources:
+                            u = src.get("url", "") or ""
+                            if "/nepal/" in u and "nepal" not in (enhanced_goal.lower() + " " + preferences.lower()):
+                                continue
+                            q = (src.get("query") or "").lower()
+                            if "flight" in q or "fare" in q or "flight" in (src.get("title") or "").lower():
+                                flight_src = src.get("url")
+                                break
+                                
                 if flight_src:
                     try:
                         extracted_budget["flight_source"] = flight_src
@@ -725,7 +931,9 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
         "currency_symbol": currency_symbol,
         "result": result,
         "sources": list(_active_search_sources),  # URLs fetched by Tavily during this run
-        "extracted_budget": extracted_budget
+        "extracted_budget": extracted_budget,
+        "origin_city": origin_city,
+        "destination_city": destination_city
     }
 
     # Save to cache (best-effort)
