@@ -5,12 +5,19 @@ AI-powered vacation planner built with **CrewAI**, **OpenAI**, and **Streamlit**
 It creates personalized trip plans, day-by-day itineraries, local-currency budgets, and booking timelines using a multi-agent workflow.
 
 ## Features
-- Multi-agent research, itinerary, and budgeting flow
+- 5-agent CrewAI workflow (see below), with research split into two parallel subagents for faster runs
 - Destination validation and date handling
 - Dynamic currency detection
 - Live web search citations
 - Synced planner + cost calculator tabs
 - CrewAI compatibility fixes for newer versions
+
+## Agents (crew_planner.py)
+- ✈️ **Flight & Transport Specialist** — flights + local transport (async, runs in parallel)
+- 🏨 **Accommodation & Attractions Specialist** — lodging + top attractions (async, runs in parallel)
+- 📅 **Itinerary Planner** — day-by-day schedule (async, depends on both research agents)
+- 💰 **Financial Coordinator** — itemized local-currency budget (async, depends on both research agents)
+- 📋 **Trip Director** — merges all outputs into the final plan (depends on all four agents above)
 
 ## Project structure
 - [app.py](app.py): Streamlit app and main UI

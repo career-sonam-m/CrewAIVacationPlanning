@@ -27,11 +27,10 @@ try:
     from crewai.tools import BaseTool
 except ImportError:
     try:
-        from crewai.tools.tool_calling import BaseTool
+        from crewai_tools import BaseTool
     except ImportError:
-        class BaseTool:
-            """Fallback for CrewAI versions that no longer expose BaseTool at this import path."""
-            pass
+        # langchain_core.tools.BaseTool is what CrewAgentExecutor actually validates tools against.
+        from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 
 # Helper utilities & calculation tools
@@ -175,7 +174,7 @@ def validate_destination_quick(vacation_goal, api_key):
     os.environ["OPENAI_API_KEY"] = api_key
     model_name = os.getenv("PLANNER_MODEL", "gpt-4o-mini")
     temperature = float(os.getenv("PLANNER_TEMPERATURE", "0.0"))
-    llm = ChatOpenAI(model=model_name, temperature=temperature, openai_api_key=api_key)
+    llm = ChatOpenAI(model=model_name, temperature=temperature)
 
     prompt = (
         "You are an expert geographer validator. Validate the vacation destination in this goal:\n"
@@ -271,12 +270,14 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
     model_name = os.getenv("PLANNER_MODEL", "gpt-4o-mini")
     temperature = float(os.getenv("PLANNER_TEMPERATURE", "0.0"))
     # Tunable agent execution parameters to trade speed vs quality
-    default_max_iter = int(os.getenv("PLANNER_MAX_ITER", "2"))
-    default_max_exec_time = int(os.getenv("PLANNER_MAX_EXEC_TIME", "90"))
+    # NOTE: now that tools are correctly recognized by crewai (see BaseTool import fix),
+    # agents actually invoke them (searches, calculations) and need more than 1-2 steps to finish.
+    default_max_iter = int(os.getenv("PLANNER_MAX_ITER", "8"))
+    default_max_exec_time = int(os.getenv("PLANNER_MAX_EXEC_TIME", "120"))
 
     # Direct LLM for fast pre-flight calls (no Crew overhead)
-    llm_direct = ChatOpenAI(model=model_name, temperature=temperature, openai_api_key=api_key)
-    llm = ChatOpenAI(model=model_name, temperature=temperature, openai_api_key=api_key)
+    llm_direct = ChatOpenAI(model=model_name, temperature=temperature)
+    llm = ChatOpenAI(model=model_name, temperature=temperature)
 
     # Initialize Tavily web search tool (optional — agents fall back to LLM knowledge if not provided)
     web_search_tool = create_web_search_tool(tavily_api_key)
@@ -327,6 +328,25 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
         enhanced_dates = validate_and_adjust_dates(dates)
         currency_symbol = get_currency_symbol(detected_currency)
 
+        # Compute ONE authoritative trip-day count from the actual date range so every agent
+        # (research/itinerary/financial/coordination) uses the same number instead of each
+        # independently inferring it — this is what previously caused the Financial Coordinator to
+        # use a different day count (e.g. from wording like "7-day trip") than the exported JSON.
+        trip_num_days = 7
+        try:
+            if " to " in enhanced_dates:
+                start_str, end_str = enhanced_dates.split(" to ")
+                start_dt = datetime.strptime(start_str.strip(), "%Y-%m-%d")
+                end_dt = datetime.strptime(end_str.strip(), "%Y-%m-%d")
+                trip_num_days = max(1, (end_dt - start_dt).days)
+        except Exception:
+            pass
+        trip_duration_line = (
+            f"TRIP DURATION: exactly {trip_num_days} days. Use this EXACT number for every "
+            "day-based calculation (hotel nights, food days, itinerary days). Do NOT recount or "
+            "re-infer this from the dates or from any wording elsewhere in the goal text.\n"
+        )
+
         # ==================================================================
         # MAIN CREW PHASE — CrewAI Multi-Agent Architecture
         # ==================================================================
@@ -339,20 +359,41 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
         search_tools = [web_search_tool] if web_search_tool else []
         financial_tools = search_tools + [calculator_tool, trip_budget_calculator]
 
-        research_agent = Agent(
-            role="Travel & Attractions Research Specialist",
+        flight_transport_agent = Agent(
+            role="Flight & Transport Research Specialist",
             goal=(
-                f"Research comprehensive travel options for: {enhanced_goal}. "
+                f"Research flights and local transport for: {enhanced_goal}. "
                 f"FLIGHT ROUTE: {flight_route} (round-trip). "
-                f"Find flights with specific airline names, accommodations, transport, and 10 must-visit attractions "
+                f"Find flights with specific airline names and local transport options "
+                f"with pricing in local currency ({detected_currency}). "
+                f"Tailor all recommendations for the travel party: {enhanced_family}."
+            ),
+            backstory=(
+                "You are a seasoned travel researcher specializing in flights and ground transport. "
+                "You always research flights for the EXACT route specified, "
+                "naming specific airlines that operate on that route. "
+                "You always consider the composition of the travel party "
+                "when making recommendations — solo travelers get different suggestions than families with kids."
+            ),
+            tools=search_tools,
+            llm=llm,
+            verbose=False,
+            allow_delegation=False,
+            max_iter=default_max_iter,
+            max_execution_time=default_max_exec_time,
+        )
+
+        stay_attractions_agent = Agent(
+            role="Accommodation & Attractions Research Specialist",
+            goal=(
+                f"Research accommodations and top attractions for: {enhanced_goal}. "
+                f"Find accommodations and 10 must-visit attractions "
                 f"with pricing in local currency ({detected_currency}). "
                 f"Tailor all recommendations for the travel party: {enhanced_family}."
             ),
             backstory=(
                 "You are a seasoned travel researcher with deep expertise in global destinations. "
-                "You specialize in finding diverse accommodation options, competitive flight deals, "
-                "and hidden-gem attractions. You always research flights for the EXACT route specified, "
-                "naming specific airlines that operate on that route. "
+                "You specialize in finding diverse accommodation options and hidden-gem attractions. "
                 "You always consider the composition of the travel party "
                 "when making recommendations — solo travelers get different suggestions than families with kids."
             ),
@@ -425,13 +466,16 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
         )
 
         # --- Define CrewAI Tasks ---
+        # Flights/transport and accommodation/attractions are independent — running them as two
+        # separate async subagent tasks lets them execute concurrently instead of one long serial task.
 
-        research_task = Task(
+        flight_transport_task = Task(
             description=(
-                f"Research travel options and top attractions for:\n"
+                f"Research flights and local transport for:\n"
                 f"Goal: {enhanced_goal}\n"
                 f"FLIGHT ROUTE: {flight_route} (round-trip)\n"
                 f"Dates: {enhanced_dates}\n"
+                f"{trip_duration_line}"
                 f"Travel party: {enhanced_family}\n"
                 f"Preferences: {preferences}\n\n"
                 "DYNAMIC PRICING INSTRUCTIONS:\n"
@@ -446,12 +490,32 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "  * For EACH option: state airline name, whether direct or connecting, flight duration, "
                 "and estimated round-trip fare per person based on travel dates and seasonality\n"
                 "  * Calculate total flight cost for the whole party\n"
+                "- Local transport options with pricing:\n"
+                "  * Rail passes, car rental, ride-sharing and public transit costs\n\n"
+                f"Use the LOCAL CURRENCY ({detected_currency}) for all pricing.\n"
+                "If any option requires online bookings, flag it with 'ACTION REQUIRED'."
+            ),
+            expected_output=(
+                "A research report covering: 2 flight options with prices and airline names, "
+                f"and local transport options with costs — all in {detected_currency}."
+            ),
+            agent=flight_transport_agent,
+            async_execution=True,
+        )
+
+        stay_attractions_task = Task(
+            description=(
+                f"Research accommodations and top attractions for:\n"
+                f"Goal: {enhanced_goal}\n"
+                f"Dates: {enhanced_dates}\n"
+                f"{trip_duration_line}"
+                f"Travel party: {enhanced_family}\n"
+                f"Preferences: {preferences}\n\n"
+                "Provide DIVERSE and SPECIFIC recommendations:\n"
                 "- 2-3 accommodation types with SPECIFIC, UNIQUE hotels/properties:\n"
                 "  * Avoid generic chain hotels when possible\n"
                 "  * Provide options suitable for the composition of the party\n"
                 f"  * Estimate per-night rates in LOCAL CURRENCY ({detected_currency}) for dates specified\n"
-                "- Local transport options with pricing:\n"
-                "  * Rail passes, car rental, ride-sharing and public transit costs\n"
                 "- 10 must-visit attractions:\n"
                 "  * Attraction name, location, visit duration, cost per person in LOCAL CURRENCY\n"
                 f"  * IMPORTANT: If {enhanced_family} has NO children/kids, do NOT recommend child-centric attractions\n"
@@ -460,11 +524,11 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "If any option requires online bookings, flag it with 'ACTION REQUIRED'."
             ),
             expected_output=(
-                "A comprehensive research report covering: flight options with prices, "
-                "accommodation recommendations with nightly rates, local transport options with costs, "
+                "A research report covering: accommodation recommendations with nightly rates "
                 f"and 10 must-visit attractions with per-person pricing — all in {detected_currency}."
             ),
-            agent=research_agent,
+            agent=stay_attractions_agent,
+            async_execution=True,
         )
 
         itinerary_task = Task(
@@ -472,9 +536,10 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 f"Build a detailed daily itinerary for the travel party:\n"
                 f"Goal: {enhanced_goal}\n"
                 f"Dates: {enhanced_dates}\n"
+                f"{trip_duration_line}"
                 f"Travel party: {enhanced_family}\n"
                 f"Preferences: {preferences}\n\n"
-                "Use the research findings from the Research Specialist to inform your schedule.\n\n"
+                "Use the research findings from the Research Specialists to inform your schedule.\n\n"
                 "For each day list:\n"
                 "- Morning / Afternoon / Evening activities\n"
                 "- Estimated travel time between stops\n"
@@ -487,7 +552,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "activities, travel times between stops, and practical notes for the travel party."
             ),
             agent=itinerary_agent,
-            context=[research_task],
+            context=[flight_transport_task, stay_attractions_task],
             async_execution=True,
         )
 
@@ -499,9 +564,10 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 f"Goal: {enhanced_goal}\n"
                 f"FLIGHT ROUTE: {flight_route} (round-trip)\n"
                 f"Dates: {enhanced_dates}\n"
+                f"{trip_duration_line}"
                 f"Travel party: {enhanced_family}\n"
                 f"Preferences: {preferences}\n\n"
-                "Use the research findings from the Research Specialist.\n"
+                "Use the research findings from the Research Specialists.\n"
                 "CRITICAL: Use your Calculator tool for all math calculations (multiplication of rates, summing categories, contingency percentage).\n\n"
                 "FLIGHT COSTS:\n"
                 f"1. The flight route is: {flight_route} (round-trip). Use this EXACT route for pricing.\n"
@@ -535,7 +601,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "and a prominently displayed grand total with min/max range."
             ),
             agent=financial_agent,
-            context=[research_task],
+            context=[flight_transport_task, stay_attractions_task],
             async_execution=True,
         )
 
@@ -543,6 +609,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
             description=(
                 "Assemble the FINAL travel plan from all agent outputs.\n\n"
                 f"Travel Dates: {enhanced_dates}\n"
+                f"{trip_duration_line}"
                 f"Current Date (Today): {current_date_str}\n\n"
                 "CRITICAL INSTRUCTIONS FOR FINAL OUTPUT:\n"
                 f"1. ALL currency amounts must use LOCAL CURRENCY ({detected_currency}) with symbol ({currency_symbol})\n"
@@ -552,7 +619,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "   - Local transport (total for entire trip)\n"
                 "   - Food (total for entire trip)\n"
                 "   - Activities and attractions\n"
-                "   - Contingency fund (10-15% of subtotal)\n"
+                "   - Contingency fund (EXACTLY 12% of subtotal — must match the Financial Coordinator's figure)\n"
                 "3. Calculate: FINAL TOTAL = Sum of all above categories\n"
                 "4. Display prominently:\n"
                 f"   'Final Estimated Budget: [AMOUNT] [CURRENCY CODE] ({currency_symbol})'\n"
@@ -571,7 +638,8 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "  Include estimated saving amount in local currency where possible.\n"
                 "- DO NOT write any booking checklist or booking timeline section — that is handled separately.\n"
                 "- RAW DATA EXPORT: At the very end of your response, output a strict JSON block enclosed in ```json ... ``` tags containing exactly these keys in local currency (costs as floats, text as strings, counts as integers):\n"
-                '  {"airline_name": "<Specific recommended airline>", "flight_route": "<origin to destination>", "flight_pp": <round-trip flight cost PER PERSON (do NOT put total cost)>, "hotel_pn": <hotel cost per night for whole party>, "food_ppd": <food cost per person per day>, "activities": <total activities cost>, "transport": <total local transport cost>, "num_adults": <total adults>, "num_children": <total children>, "num_days": <total days of the trip>}\n\n'
+                '  {"airline_name": "<Specific recommended airline>", "flight_route": "<origin to destination>", "flight_pp": <round-trip flight cost PER PERSON (do NOT put total cost)>, "hotel_pn": <total accommodation cost DIVIDED BY num_days below, so hotel_pn * num_days equals the accommodation total you displayed>, "food_ppd": <food cost per person per day>, "activities": <total activities cost>, "transport": <total local transport cost>, "num_adults": <total adults>, "num_children": <total children>, "num_days": '
+                f'<MUST be exactly {trip_num_days}, the trip duration given above — do not use any other number>, "contingency_pct": <the exact contingency percentage you used, e.g. 12.0>}}\n\n'
                 "Format clearly for sharing with travelers. Ensure all monetary amounts use the correct currency symbol."
             ),
             expected_output=(
@@ -580,16 +648,16 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 f"All amounts in {detected_currency} with {currency_symbol} symbol."
             ),
             agent=coordination_agent,
-            context=[research_task, itinerary_task, budget_task],
+            context=[flight_transport_task, stay_attractions_task, itinerary_task, budget_task],
         )
 
         # --- Assemble and Run the CrewAI Crew ---
 
-        st.write("🗓️ **Step 3/3**: CrewAI agents generating itinerary & budget concurrently, then compiling final plan...")
+        st.write("🗓️ **Step 3/3**: CrewAI agents researching, generating itinerary & budget concurrently, then compiling final plan...")
 
         vacation_crew = Crew(
-            agents=[research_agent, itinerary_agent, financial_agent, coordination_agent],
-            tasks=[research_task, itinerary_task, budget_task, coordination_task],
+            agents=[flight_transport_agent, stay_attractions_agent, itinerary_agent, financial_agent, coordination_agent],
+            tasks=[flight_transport_task, stay_attractions_task, itinerary_task, budget_task, coordination_task],
             process=Process.sequential,
             llm=llm,
             cache=True,

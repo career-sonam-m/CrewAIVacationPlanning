@@ -177,11 +177,12 @@ if __name__ == "__main__":
     
     st.sidebar.markdown("### 🤖 CrewAI Multi-Agent Team")
     st.sidebar.markdown("""
-    This app orchestrates **4 specialized AI agents** operating in parallel and sequential workflows:
+    This app orchestrates **5 specialized AI agents** operating in parallel and sequential workflows:
 
-    - 🔍 **Research Specialist**: Real-time web search for flight tiers, lodging rates, transport, & attractions.
-    - 📅 **Itinerary Planner**: Crafts detailed day-by-day schedules (*Async Parallel Execution*).
-    - 💰 **Financial Coordinator**: Calculates local currency budgets & 5 money saving tips (*Async Parallel Execution*).
+    - ✈️ **Flight & Transport Specialist**: Real-time web search for flight fares & local transport options.
+    - 🏨 **Accommodation & Attractions Specialist**: Real-time web search for lodging rates & top attractions.
+    - 📅 **Itinerary Planner**: Crafts detailed day-by-day schedules.
+    - 💰 **Financial Coordinator**: Calculates local currency budgets & 5 money saving tips.
     - 📋 **Trip Director**: Merges all agent outputs into a polished final master deliverable.
     """)
 

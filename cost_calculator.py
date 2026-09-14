@@ -8,6 +8,9 @@ This module implements:
 """
 
 from typing import Type
+import ast
+import operator
+import re
 from pydantic import BaseModel, Field
 import streamlit as st
 
@@ -15,11 +18,49 @@ try:
     from crewai.tools import BaseTool
 except ImportError:
     try:
-        from crewai.tools.tool_calling import BaseTool
+        from crewai_tools import BaseTool
     except ImportError:
-        class BaseTool:
-            """Fallback for CrewAI versions that no longer expose BaseTool at this import path."""
-            pass
+        # langchain_core.tools.BaseTool is what CrewAgentExecutor actually validates tools against.
+        from langchain_core.tools import BaseTool
+
+
+# ---------------------------------------------------------------------------
+# Safe arithmetic expression evaluator (no eval()/exec() — AST allowlist only)
+# ---------------------------------------------------------------------------
+
+_ALLOWED_BINOPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_ALLOWED_UNARYOPS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+_ALLOWED_FUNCS = {"abs": abs, "round": round, "min": min, "max": max}
+
+
+def _eval_ast_node(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
+        return _ALLOWED_BINOPS[type(node.op)](_eval_ast_node(node.left), _eval_ast_node(node.right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARYOPS:
+        return _ALLOWED_UNARYOPS[type(node.op)](_eval_ast_node(node.operand))
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _ALLOWED_FUNCS:
+        args = [_eval_ast_node(a) for a in node.args]
+        return _ALLOWED_FUNCS[node.func.id](*args)
+    raise ValueError("Unsupported or unsafe expression element")
+
+
+def safe_eval_expression(expression: str) -> float:
+    """Evaluate a plain arithmetic expression without using eval()/exec()."""
+    parsed = ast.parse(expression, mode="eval").body
+    return _eval_ast_node(parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -158,11 +199,13 @@ class CalculatorTool(BaseTool):
     args_schema: Type[BaseModel] = CalculatorInput
 
     def _run(self, expression: str) -> str:
-        """Safely evaluate mathematical expression."""
+        """Safely evaluate a mathematical expression using an AST allowlist (no eval())."""
         try:
-            clean_expr = expression.replace(",", "").replace("$", "").replace("¥", "").replace("€", "").replace("₹", "").strip()
-            allowed_names = {"abs": abs, "round": round, "min": min, "max": max}
-            result = eval(clean_expr, {"__builtins__": None}, allowed_names)
+            clean_expr = expression.replace("$", "").replace("¥", "").replace("€", "").replace("₹", "").strip()
+            # Strip thousands-separator commas (e.g. "1,500" or "12,000.50") without breaking
+            # multi-arg calls like round(x, 2) or max(1,2,3) — only matches groups of exactly 3 digits.
+            clean_expr = re.sub(r'(?<=\d),(?=\d{3}(?!\d))', '', clean_expr)
+            result = safe_eval_expression(clean_expr)
             return f"Result: {result}"
         except Exception as e:
             return f"Calculation error for '{expression}': {str(e)}"
@@ -483,6 +526,7 @@ def sync_plan_to_calculator(plan_data: dict) -> dict:
         "calc_adults": int(eb.get("num_adults", 2)),
         "calc_children": int(eb.get("num_children", 0)),
         "calc_days": int(eb.get("num_days", 7)),
+        "calc_cont": float(eb.get("contingency_pct", 12.0)),
         "calc_currency_select": currency_select,
         "calc_prev_currency": sym,
     }
