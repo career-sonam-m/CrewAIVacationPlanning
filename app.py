@@ -143,6 +143,24 @@ if __name__ == "__main__":
             font-size: 0.9rem !important;
             font-weight: 600 !important;
         }
+        /* Primary CTA button (Generate Vacation Plan) — subtly distinct from secondary/demo buttons */
+        button[kind="primary"], button[kind="primaryFormSubmit"],
+        [data-testid*="-primary"] button, button[data-testid*="-primary"] {
+            background-color: #0f172a !important;
+            color: white !important;
+            border: none !important;
+            border-radius: 8px !important;
+            font-weight: 600 !important;
+            font-size: 1rem !important;
+            padding: 0.6rem 1.2rem !important;
+            box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.15) !important;
+            transition: all 0.2s ease-in-out !important;
+        }
+        button[kind="primary"]:hover, button[kind="primaryFormSubmit"]:hover,
+        [data-testid*="-primary"] button:hover, button[data-testid*="-primary"]:hover {
+            background-color: #1e293b !important;
+            box-shadow: 0 2px 5px 0 rgb(0 0 0 / 0.2) !important;
+        }
         </style>
     """, unsafe_allow_html=True)
 
@@ -191,8 +209,8 @@ if __name__ == "__main__":
     st.sidebar.markdown("### 🛠️ Agent Tools Suite")
     st.sidebar.markdown("""
     - 🌐 `TrackedTavilySearchTool`: Live Tavily web search with URL citation tracking.
-    - 🧮 `CalculatorTool`: Fast mathematical expression evaluator.
-    - 📊 `TripCostCalculatorTool`: Structured budget math engine shared with the UI calculator.
+    - 🧮 `CalculatorTool`: General-purpose evaluator used by agents for basic arithmetic checks (e.g. rate × days).
+    - 📊 `TripCostCalculatorTool`: Structured domain-specific tool that calculates full itemized budgets, subtotals, contingency buffers, and per-person rates.
     """)
 
     st.sidebar.markdown("---")
@@ -278,7 +296,7 @@ if __name__ == "__main__":
                 height=80
             )
             
-            submit_btn = st.form_submit_button("🚀 Generate Vacation Plan")
+            submit_btn = st.form_submit_button("🚀 Generate Vacation Plan", type="primary", use_container_width=True)
 
         # Add quick demo buttons outside the form
         st.markdown(render_section_header("Quick Actions", icon="⚡", subtitle="Run demos or presets"), unsafe_allow_html=True)
@@ -446,14 +464,17 @@ if __name__ == "__main__":
                 airline = eb.get("airline_name")
                 route = eb.get("flight_route")
                 flight_cost = eb.get("flight_pp")
+                flight_src = eb.get("flight_source")
                 
                 if airline and route and flight_cost is not None:
                     sym = res.get("currency_symbol", "")
+                    link_line = f"  \n**Link:** [Book / Compare Flights]({flight_src})" if flight_src else ""
                     st.info(
                         f"✈️ **Recommended Flight**\n\n"
                         f"**Airline:** {airline}  \n"
                         f"**Route:** {route}  \n"
                         f"**Cost:** {sym}{flight_cost:,.2f} per person"
+                        f"{link_line}"
                     )
 
             # Extract Money Saving Tips from plan

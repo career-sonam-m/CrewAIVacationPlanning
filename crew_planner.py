@@ -2,8 +2,8 @@
 CrewAI Planner Orchestrator - CrewAI Vacation Planner
 
 This module defines the CrewAI multi-agent system including:
-- 4 specialized agents (Research Specialist, Itinerary Planner, Financial Coordinator, Trip Director)
-- 4 workflow tasks (Research, Itinerary [async], Budget [async], Coordination)
+- 5 specialized agents (Flight & Transport Specialist, Accommodation & Attractions Specialist, Itinerary Planner, Financial Coordinator, Trip Director)
+- 5 workflow tasks (Flight & Transport, Accommodation & Attractions [async], Itinerary [async], Budget [async], Coordination)
 - Custom TrackedTavilySearchTool with URL capture
 - Pre-flight destination validation (direct LLM call for speed)
 - Orchestrator function `run_vacation_planner(...)`
@@ -638,7 +638,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "  Include estimated saving amount in local currency where possible.\n"
                 "- DO NOT write any booking checklist or booking timeline section — that is handled separately.\n"
                 "- RAW DATA EXPORT: At the very end of your response, output a strict JSON block enclosed in ```json ... ``` tags containing exactly these keys in local currency (costs as floats, text as strings, counts as integers):\n"
-                '  {"airline_name": "<Specific recommended airline>", "flight_route": "<origin to destination>", "flight_pp": <round-trip flight cost PER PERSON (do NOT put total cost)>, "hotel_pn": <total accommodation cost DIVIDED BY num_days below, so hotel_pn * num_days equals the accommodation total you displayed>, "food_ppd": <food cost per person per day>, "activities": <total activities cost>, "transport": <total local transport cost>, "num_adults": <total adults>, "num_children": <total children>, "num_days": '
+                '  {"airline_name": "<Specific recommended airline>", "flight_route": "<origin to destination>", "flight_pp": <round-trip flight cost PER PERSON (do NOT put total cost)>, "hotel_pn": <total accommodation cost DIVIDED BY num_days below, so hotel_pn * num_days equals the accommodation total you displayed>, "food_ppd": <food cost PER PERSON PER DAY, such that food_ppd * total travelers (adults + children) * num_days EXACTLY equals the Food total you displayed \u2014 do NOT put the per-day cost for the whole family here>, "activities": <total activities cost>, "transport": <total local transport cost>, "num_adults": <total adults>, "num_children": <total children>, "num_days": '
                 f'<MUST be exactly {trip_num_days}, the trip duration given above — do not use any other number>, "contingency_pct": <the exact contingency percentage you used, e.g. 12.0>}}\n\n'
                 "Format clearly for sharing with travelers. Ensure all monetary amounts use the correct currency symbol."
             ),

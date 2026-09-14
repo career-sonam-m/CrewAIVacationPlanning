@@ -127,6 +127,8 @@ class TripCostInput(BaseModel):
     misc: float = Field(default=0.0, description="Optional extra or shopping budget")
     contingency_pct: float = Field(default=12.0, description="Contingency buffer percentage (5-20%)")
     currency_symbol: str = Field(default="₹", description="Currency symbol (e.g. $, €, ¥, ₹)")
+    flights: float = Field(default=0.0, description="Deprecated. Alias for flight_pp. Do not use.")
+    flight_route: str = Field(default="", description="Deprecated. Do not use.")
 
 
 class TripCostCalculatorTool(BaseTool):
@@ -150,13 +152,17 @@ class TripCostCalculatorTool(BaseTool):
         transport: float = 0.0,
         misc: float = 0.0,
         contingency_pct: float = 12.0,
-        currency_symbol: str = "₹"
+        currency_symbol: str = "₹",
+        flights: float = 0.0,
+        flight_route: str = ""
     ) -> str:
+        # Gracefully handle older model calls that pass flight totals into the wrong parameter name
+        f_pp = flight_pp if flight_pp > 0 else flights
         res = calculate_trip_budget(
             num_adults=num_adults,
             num_children=num_children,
             num_days=num_days,
-            flight_pp=flight_pp,
+            flight_pp=f_pp,
             hotel_pn=hotel_pn,
             food_ppd=food_ppd,
             activities=activities,
