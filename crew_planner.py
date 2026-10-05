@@ -34,8 +34,6 @@ from pydantic import BaseModel, Field
 
 # Helper utilities & calculation tools
 from utils import get_currency_symbol, validate_and_adjust_dates
-import ast
-import operator
 import re
 
 # ---------------------------------------------------------------------------
@@ -83,45 +81,6 @@ def calculate_trip_budget(
         "per_person": per_person,
         "currency_symbol": currency_symbol
     }
-
-
-# ---------------------------------------------------------------------------
-# Safe arithmetic expression evaluator (no eval() or sandbox bypass)
-# ---------------------------------------------------------------------------
-
-_ALLOWED_BINOPS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-    ast.FloorDiv: operator.floordiv,
-    ast.Mod: operator.mod,
-    ast.Pow: operator.pow,
-}
-_ALLOWED_UNARYOPS = {
-    ast.UAdd: operator.pos,
-    ast.USub: operator.neg,
-}
-_ALLOWED_FUNCS = {"abs": abs, "round": round, "min": min, "max": max}
-
-
-def _eval_ast_node(node):
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
-    if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
-        return _ALLOWED_BINOPS[type(node.op)](_eval_ast_node(node.left), _eval_ast_node(node.right))
-    if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARYOPS:
-        return _ALLOWED_UNARYOPS[type(node.op)](_eval_ast_node(node.operand))
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _ALLOWED_FUNCS:
-        args = [_eval_ast_node(a) for a in node.args]
-        return _ALLOWED_FUNCS[node.func.id](*args)
-    raise ValueError("Unsupported or unsafe expression element")
-
-
-def safe_eval_expression(expression: str) -> float:
-    """Evaluate a plain arithmetic expression without using eval()/exec()."""
-    parsed = ast.parse(expression, mode="eval").body
-    return _eval_ast_node(parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -211,33 +170,6 @@ class TripCostCalculatorTool(BaseTool):
             f"Per Person: {sym}{res['per_person']:,.2f}"
         )
 
-
-class CalculatorInput(BaseModel):
-    """Input schema for the general arithmetic Calculator tool."""
-    expression: str = Field(..., description="Mathematical expression string to calculate (e.g. '150 * 5 + 400 + 120').")
-
-
-class CalculatorTool(BaseTool):
-    """CrewAI-compatible tool for general mathematical arithmetic."""
-    name: str = "Calculator"
-    description: str = (
-        "Useful for calculating travel budgets, multiplying daily rates by number of days or travelers, "
-        "summing category totals, and computing contingency percentages. "
-        "Input must be a mathematical expression like '150 * 5 + 400' or '2500 * 0.15'."
-    )
-    args_schema: Type[BaseModel] = CalculatorInput
-
-    def _run(self, expression: str) -> str:
-        """Safely evaluate a mathematical expression using an AST allowlist (no eval())."""
-        try:
-            clean_expr = expression.replace("$", "").replace("¥", "").replace("€", "").replace("₹", "").strip()
-            # Strip thousands-separator commas (e.g. "1,500" or "12,000.50") without breaking
-            # multi-arg calls like round(x, 2) or max(1,2,3) — only matches groups of exactly 3 digits.
-            clean_expr = re.sub(r'(?<=\d),(?=\d{3}(?!\d))', '', clean_expr)
-            result = safe_eval_expression(clean_expr)
-            return f"Result: {result}"
-        except Exception as e:
-            return f"Calculation error for '{expression}': {str(e)}"
 
 # Global mutable list that captures URLs fetched by Tavily during a planning run.
 # Cleared before each run so sources are always fresh for the current plan.
@@ -423,7 +355,7 @@ def lookup_flight_fare(llm, origin_city, destination_city, dates, currency, sear
         return None
     try:
         query = (
-            f"{origin_city} to {destination_city} round trip economy flight fare per person "
+            f"{origin_city} to {destination_city} non-stop direct round trip economy flight fare per person "
             f"price {dates}"
         )
         search_text = search_tool._run(query)
@@ -437,7 +369,9 @@ def lookup_flight_fare(llm, origin_city, destination_city, dates, currency, sear
             "Rules:\n"
             "- Use only a TOTAL fare explicitly shown for this route in economy class. Ignore fees "
             "(cancellation/date change/baggage), 'Base Fare', 'Surcharges', and other routes.\n"
-            "- Choose the lowest representative economy total. Fares for other dates are acceptable.\n"
+            "- Prefer NON-STOP (direct) flights: pick the lowest non-stop economy total if any is shown; "
+            "only if no non-stop fare is stated, use the lowest fare with the fewest stops. "
+            "Fares for other dates are acceptable.\n"
             "- trip_type is 'round-trip' ONLY if the source explicitly says round trip/return for that price; "
             "otherwise use 'one-way'.\n"
             "- currency_code is the ISO code of the currency the amount is quoted in (e.g. INR, EUR, USD).\n"
@@ -659,7 +593,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
         # ==================================================================
         # PRE-FLIGHT PHASE — Direct LLM calls for speed
         # ==================================================================
-        st.write("🕵️ Running Optimized AI Planner (estimating 15-25 seconds)...")
+        st.write("🕵️ Checking live prices and preparing your plan. This can take a few minutes.")
         st.write("🔮 **Step 1/3**: Enhancing inputs & detecting destination local currency...")
 
         # --- Combined Single Pre-flight Call (Input Enhancement & Currency Detection) ---
@@ -754,23 +688,30 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
 
         # --- Define CrewAI Tools & Agents ---
 
-        calculator_tool = CalculatorTool()
         trip_budget_calculator = TripCostCalculatorTool()
         search_tools = [web_search_tool] if web_search_tool else []
-        financial_tools = search_tools + [calculator_tool, trip_budget_calculator]
+        financial_tools = search_tools + [trip_budget_calculator]
+
+        flight_research_instruction = (
+            f"- Flights: use the verified fare above for the recommended option on {flight_route}. "
+            "Do not search for or invent competing fare estimates; the live lookup is authoritative.\n"
+            if live_fare
+            else f"- Flights: find one current round-trip economy fare for {flight_route} using web search. "
+            "Do not repeat searches for the same route and dates.\n"
+        )
 
         research_agent = Agent(
             role="Travel & Attractions Research Specialist",
             goal=(
                 f"Research comprehensive travel options for: {enhanced_goal}. "
                 f"FLIGHT ROUTE: {flight_route} (round-trip). "
-                f"Find flights with specific airline names, accommodations, transport, and 10 must-visit attractions "
+                f"Find flight details, accommodations, transport, and 10 must-visit attractions "
                 f"with pricing in local currency ({detected_currency}). "
                 f"Tailor all recommendations for the travel party: {enhanced_family}."
             ),
             backstory=(
                 "You are a seasoned travel researcher with deep expertise in global destinations. "
-                "You specialize in finding diverse accommodation options, competitive flight deals, "
+                "You specialize in finding diverse accommodation options, "
                 "and hidden-gem attractions. You always research flights for the EXACT route specified, "
                 "naming specific airlines that operate on that route. "
                 "You always consider the composition of the travel party "
@@ -814,7 +755,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "You are a meticulous financial analyst specializing in travel budgets. "
                 "You calculate costs based on real-world pricing, factoring in seasonality, "
                 "party size (including whether children need separate tickets/seats), and destination cost of living. "
-                "Use the Calculator and Trip Budget Calculator tools to perform accurate sum totals and itemized breakdowns."
+                "Use the Trip Budget Calculator tool once to perform the itemized budget calculation."
             ),
             tools=financial_tools,
             llm=llm,
@@ -833,10 +774,10 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
             ),
             backstory=(
                 "You are a senior travel coordinator who synthesizes complex travel data into clear, "
-                "actionable travel plans. You verify budget totals using the Calculator and Trip Budget Calculator tools, ensure consistency across sections, "
+                "actionable travel plans. You preserve the Financial Coordinator's totals and ensure consistency across sections, "
                 "and format the final deliverable for easy sharing with travelers."
             ),
-            tools=[calculator_tool, trip_budget_calculator],
+            tools=[],
             llm=llm,
             verbose=False,
             allow_delegation=False,
@@ -861,20 +802,11 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "DYNAMIC PRICING INSTRUCTIONS:\n"
                 "1. Analyze travel dates for seasonality impact on pricing\n"
                 "2. Provide CURRENT estimated costs (not generic/historical prices)\n"
-                "3. Note if travel dates fall during peak season (affects all prices by 30-80%)\n"
-                "4. Compare realistic price ranges for different booking windows\n\n"
+                "3. Note whether travel dates fall during peak season\n"
+                "4. Do not repeat searches for facts already present in the live data below\n\n"
                 "Provide DIVERSE and SPECIFIC recommendations:\n"
-                f"- 2 flight options for the EXACT route {flight_route} (round-trip):\n"
-                "  * Option 1: Budget airline — NAME THE SPECIFIC AIRLINE\n"
-                "  * Option 2: Full-service carrier — NAME THE SPECIFIC AIRLINE (e.g. Air India, Lufthansa, Emirates)\n"
-                "  * For EACH option: state airline name, whether direct or connecting, flight duration, "
-                "and estimated round-trip fare per person based on travel dates and seasonality\n"
-                "  * Calculate total flight cost for the whole party\n"
-                "  * MANDATORY: use the Web Search tool to look up current fares for this exact route and travel dates "
-                "BEFORE quoting any price. Quote only ROUND-TRIP ECONOMY fares. If a source shows a one-way price, "
-                "double it; never present a one-way or promotional teaser fare as the round-trip fare.\n"
-                "  * Long-haul intercontinental round trips (e.g. India to Europe/US) are rarely cheap; if your figure "
-                "looks unusually low for the distance, re-check it with another search\n"
+                f"{flight_research_instruction}"
+                f"  * Give airline and direct/connecting details for {flight_route}; recommend NON-STOP (direct) flights by default and only mention connecting flights if no non-stop exists.\n"
                 "- 2-3 accommodation types with SPECIFIC, UNIQUE hotels/properties:\n"
                 "  * Avoid generic chain hotels when possible\n"
                 "  * Provide options suitable for the composition of the party\n"
@@ -889,7 +821,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "If any option requires online bookings, flag it with 'ACTION REQUIRED'."
             ),
             expected_output=(
-                "A comprehensive research report covering: flight options with prices, "
+                "A comprehensive research report covering: flight details, "
                 "accommodation recommendations with nightly rates, local transport options with costs, "
                 f"and 10 must-visit attractions with per-person pricing — all in {detected_currency}."
             ),
@@ -933,31 +865,28 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 f"{flight_fare_line}"
                 f"Travel party: {enhanced_family}\n"
                 f"Preferences: {preferences}\n\n"
-                "Use the research findings from the Research Specialist.\n"
-                "CRITICAL: Use your Calculator tool for all math calculations (multiplication of rates, summing categories, contingency percentage).\n\n"
+                "Use the research findings from the Research Specialist and the live price benchmarks supplied above. "
+                "Do not search again for prices already supplied.\n"
+                "Use the Trip Budget Calculator once for the complete itemized budget after choosing the input rates.\n\n"
                 "FLIGHT COSTS:\n"
                 f"1. The flight route is: {flight_route} (round-trip). Use this EXACT route for pricing.\n"
-                "2. Name the SPECIFIC AIRLINE(S) for each option.\n"
-                "3. Determine a realistic economy class ROUND-TRIP fare per person for this specific route, using the "
-                "fares found in the research findings. Never use a one-way fare; do not go below the lowest round-trip "
-                "fare found in the research unless a cited source supports it.\n"
-                "4. Factor in the travel season: high season routes command higher prices.\n"
-                "5. Count the total number of travelers. Children aged 2+ require a full paid seat.\n"
-                "6. Calculate using Calculator tool: [per-person fare] × [total travelers] = Total flight cost.\n"
-                "7. Show this calculation explicitly with airline name and route.\n"
-                "8. Cite source: Tavily search URLs if available, otherwise state 'based on market trends'.\n\n"
+                "2. Name the specific airline for the recommended option when supported by the live lookup or research. Recommend a non-stop (direct) flight by default.\n"
+                "3. Use the verified live fare exactly when provided. Otherwise use a sourced round-trip economy fare "
+                "from the research findings; never substitute a one-way fare.\n"
+                "4. Count the total number of travelers. Children aged 2+ require a full paid seat.\n"
+                "5. Cite the available flight source; do not perform another fare search.\n\n"
                 "ACCOMMODATION:\n"
                 "- Based on party size, determine number of rooms required.\n"
-                "- Calculate using Calculator tool: [nightly rate] × [rooms] × [nights] = Total accommodation cost.\n\n"
+                "- Include the chosen nightly rate, room count and number of nights in the budget calculator inputs.\n\n"
                 "FOOD & DINING:\n"
                 "- Estimate daily food spend per person from the live benchmark above when provided, otherwise "
                 "from search results for this destination's cost of living.\n"
-                "- Calculate using Calculator tool: [daily food cost] × [people] × [days] = Total food cost.\n\n"
+                "- Use the selected daily food rate, number of people and trip duration in the budget calculator inputs.\n\n"
                 "ACTIVITIES & LOCAL TRANSPORT:\n"
                 "- Use attraction ticket prices from research for the specific party composition.\n"
                 "- Estimate local transport costs for the trip duration.\n\n"
                 "GRAND TOTAL:\n"
-                "- Use Calculator tool to sum ALL categories + 12% contingency.\n"
+                "- Use the budget calculator result for the subtotal, contingency and grand total.\n"
                 "- Show minimum and maximum range.\n"
                 "- Display prominently.\n\n"
                 f"Use the LOCAL CURRENCY ({detected_currency}) for all amounts.\n"
@@ -993,7 +922,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "3. Calculate: FINAL TOTAL = Sum of all above categories\n"
                 "4. Display prominently:\n"
                 f"   'Final Estimated Budget: [AMOUNT] [CURRENCY CODE] ({currency_symbol})'\n"
-                "5. Use your Calculator tool to verify the total matches the exact sum of the breakdown table\n"
+                "5. Copy the Financial Coordinator's calculated budget totals exactly; do not recalculate them\n"
                 "6. Cite flight cost sources (Tavily URLs or general market trends)\n\n"
                 "PRODUCE A FINAL DELIVERABLE CONTAINING:\n"
                 f"- Executive summary (1-2 paragraphs). Explicitly state travel party: {enhanced_family}\n"
@@ -1039,6 +968,11 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
         try:
             crew_output = vacation_crew.kickoff()
             result = str(crew_output)
+            if "Agent stopped due to iteration limit or time limit" in result:
+                raise RuntimeError(
+                    "A CrewAI agent reached its iteration or time limit before completing the plan. "
+                    "Try again; the incomplete result will not be cached."
+                )
             
             # Extract JSON block from output
             import re, json
@@ -1082,7 +1016,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                     
                     import urllib.parse
                     # Generate a precise Google Flights travel search deep link using exact travel parameters
-                    query_term = f"Flights from {origin_clean} to {dest_clean} on {start_date_str} roundtrip returning {end_date_str}"
+                    query_term = f"Flights from {origin_clean} to {dest_clean} on {start_date_str} roundtrip returning {end_date_str} nonstop"
                     encoded_query = urllib.parse.quote(query_term)
                     precise_search_url = f"https://www.google.com/travel/flights?q={encoded_query}"
             except Exception:
@@ -1107,15 +1041,10 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                     except Exception:
                         pass
         except Exception as e:
-            st.error(f"CrewAI execution failed: {e}")
-            result = f"Error during plan generation: {str(e)}"
+            progress_placeholder.error(f"Planner stopped before completing the plan: {e}")
+            raise RuntimeError(f"CrewAI execution failed: {e}") from e
 
-        # Replace status with a success message in the placeholder
-        try:
-            progress_placeholder.success("✨ Travel plan generated successfully!")
-        except Exception:
-            # Fallback: write a success line in the container
-            progress_container.write("✨ Travel plan generated successfully!")
+        progress_placeholder.success("✨ Travel plan generated successfully!")
 
     result_obj = {
         "enhanced_goal": enhanced_goal,

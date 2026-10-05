@@ -5,11 +5,10 @@ AI-powered vacation planner built with **CrewAI**, **OpenAI**, and **Streamlit**
 It creates personalized trip plans, day-by-day itineraries, local-currency budgets, booking timelines, and deep-linked flight searches using robust multi-agent orchestration.
 
 ## Features
-- **4-Agent CrewAI Workflow**: Operates sequentially and concurrently to research, map schedules, and tally itemized pricing.
+- **4-Agent CrewAI Workflow**: Research and itinerary/budget tasks are coordinated before the Trip Director assembles the plan.
 - **Live Price Lookups (no hardcoded prices)**: Round-trip flight fare and hotel, food, transport and attraction benchmarks come from Tavily web search. An LLM only extracts the quoted amount, and code handles one-way doubling and conversion into the destination currency using a live exchange rate (open.er-api.com). Results are injected into the agent prompts.
 - **Fare Verification Warning**: The Recommended Flight box shows a warning when the fare is not backed by a live search.
 - **Dynamic Google Flights Link**: Automatically parses your source city, destination, and selected travel dates to compile exact, live round-trip flight booking routes.
-- **Safe Evaluation Sandbox**: Safe AST-evaluation logic (A03 Injection Protected) for error-free math calculations.
 - **Strict Budget Consistency**: Programmatic schema assertions to ensure per-person and total day metrics are perfectly matched.
 
 ## Agents (crew_planner.py)
@@ -20,8 +19,7 @@ It creates personalized trip plans, day-by-day itineraries, local-currency budge
 
 ## Agent tools
 - 🌐 `TrackedTavilySearchTool` — Live Tavily web search with source URL tracking (optional; needs `TAVILY_API_KEY`).
-- 🧮 `CalculatorTool` — General arithmetic evaluator for quick checks (e.g. rate × days).
-- 📊 `TripCostCalculatorTool` — Itemized budget calculator: category totals, subtotal, contingency, grand total, and per-person cost.
+- 📊 `TripCostCalculatorTool` — Itemized budget calculator used once by the Financial Coordinator for category totals, subtotal, contingency, grand total, and per-person cost.
 
 ## Project structure
 - [app.py](app.py): Clean, single-page Streamlit application.
@@ -53,7 +51,9 @@ Set these in `.env` to tune the planner:
 | `PLANNER_MAX_ITER` | `15` | Max iterations per agent |
 | `PLANNER_MAX_EXEC_TIME` | `300` | Max seconds per agent |
 
-If a run ends with "Agent stopped due to iteration limit or time limit", raise the last two values.
+The planner uses the injected live flight fare and cost benchmarks instead of asking agents to repeat those lookups. The Financial Coordinator calculates the budget once, and the Trip Director copies the resulting totals rather than recalculating them.
+
+If a run stops at an iteration or time limit, it is reported as a failure and is not cached. The default limits are 15 iterations and 300 seconds per agent; only raise them if the run is making useful progress and needs more time.
 
 ## Caching
 Results are cached as JSON in `.vacation_cache/`, keyed by the trip inputs (not the code version). Delete the JSON files there to force a fresh plan, especially after changing code.

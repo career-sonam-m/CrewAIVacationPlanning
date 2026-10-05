@@ -194,7 +194,7 @@ if __name__ == "__main__":
     st.sidebar.markdown("""
     This app orchestrates **4 specialized AI agents** operating in sequential and concurrent workflows:
 
-    - 🔍 **Research Specialist**: Real-time web search for flight tiers, lodging rates, transport, & attractions.
+    - 🔍 **Research Specialist**: Real-time web search for flight details, lodging rates, transport, & attractions.
     - 📅 **Itinerary Planner**: Crafts detailed day-by-day schedules.
     - 💰 **Financial Coordinator**: Calculates local currency budgets & 5 money saving tips.
     - 📋 **Trip Director**: Merges all agent outputs into a polished final master deliverable.
@@ -205,8 +205,7 @@ if __name__ == "__main__":
     st.sidebar.markdown("### 🛠️ Agent Tools Suite")
     st.sidebar.markdown("""
     - 🌐 `TrackedTavilySearchTool`: Live Tavily web search with URL citation tracking.
-    - 🧮 `CalculatorTool`: General-purpose evaluator used by agents for basic arithmetic checks (e.g. rate × days).
-    - 📊 `TripCostCalculatorTool`: Structured domain-specific tool that calculates full itemized budgets, subtotals, contingency buffers, and per-person rates.
+    - 📊 `TripCostCalculatorTool`: Structured calculator used by the Financial Coordinator for the itemized budget and totals.
     """)
 
     st.sidebar.markdown("---")
@@ -222,7 +221,12 @@ if __name__ == "__main__":
     default_demo_dates = generate_default_demo_dates()
 
     # Plan parameters layout section
-    col1, col2 = st.columns([1.2, 1.7])
+    # Once a plan exists, show the form on top and the plan full-width below it
+    if "plan_result" in st.session_state:
+        col1 = st.container()
+        col2 = st.container()
+    else:
+        col1, col2 = st.columns([1.2, 1.7])
 
     with col1:
         st.markdown(render_section_header("Vacation Specifications", icon="📍", subtitle="Enter trip details"), unsafe_allow_html=True)
@@ -359,6 +363,7 @@ if __name__ == "__main__":
                     destination_city=destination_city
                 )
                 st.session_state.plan_result = plan_data
+                st.rerun()
             except Exception as e:
                 st.error(f"An error occurred while running the planner: {e}")
 
@@ -396,6 +401,7 @@ if __name__ == "__main__":
                         destination_city=destination_city
                     )
                     st.session_state.plan_result = plan_data
+                    st.rerun()
                 except Exception as e:
                     st.error(f"An error occurred while running the planner: {e}")
 
