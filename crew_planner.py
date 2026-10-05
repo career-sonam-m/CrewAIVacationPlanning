@@ -345,12 +345,60 @@ def validate_destination_quick(vacation_goal, api_key):
 # Live flight fare lookup (web search + LLM extraction, no hardcoded price ranges)
 # ---------------------------------------------------------------------------
 
-def lookup_flight_fare(llm, origin_city, destination_city, dates, currency, search_tool):
-    """Search the web for a flight fare and return a round-trip economy fare in the destination currency.
+def _google_flights_fare(origin_city, destination_city, dates, currency):
+    """Read the cheapest round-trip fare for the exact dates from Google Flights (already in the target
+    currency via curr=). Prefers non-stop; otherwise the fewest stops. Returns a fare dict or None."""
+    import urllib.parse
+    import urllib.request
+    from html import unescape
 
-    The LLM only extracts the quoted amount, currency and trip type from search results; doubling a
-    one-way fare and the currency conversion (live exchange rate) are done in code.
+    target_code = (re.match(r"\s*([A-Za-z]{3})", currency or "") or [None, ""])[1].upper()
+    parts = [p.strip() for p in (dates or "").split(" to ")]
+    if not (target_code and origin_city and destination_city and re.fullmatch(r"\d{4}-\d{2}-\d{2}", parts[0])):
+        return None
+    clean = lambda c: c.split(",")[0].split("(")[0].strip()
+    ret = f" returning {parts[1]}" if len(parts) > 1 and parts[1] != parts[0] else ""
+    q = f"Flights from {clean(origin_city)} to {clean(destination_city)} on {parts[0]} roundtrip{ret}"
+    url = f"https://www.google.com/travel/flights?q={urllib.parse.quote(q)}&curr={target_code}&hl=en"
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cookie": "CONSENT=YES+; SOCS=CAI",
+        })
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            html = unescape(resp.read().decode("utf-8", "ignore"))
+    except Exception:
+        return None
+
+    options = {}
+    for amount, kind, airline in re.findall(
+        r"From ([\d,]+) [A-Za-z ]+? round trip total\. (Nonstop|\d+ stops?) flight with ([^.]+?)\.", html
+    ):
+        stops = 0 if kind == "Nonstop" else int(kind.split()[0])
+        options[(stops, float(amount.replace(",", "")), airline.strip())] = True
+    if not options:
+        return None
+    stops, price, airline = min(options)
+    return {
+        "airline": airline,
+        "fare_pp": round(price, 2),
+        "currency": currency,
+        "basis": f"Google Flights round-trip total for {dates}, "
+                 f"{'non-stop' if stops == 0 else f'{stops} stop(s)'} (taxes included, 1 adult).",
+    }
+
+
+def lookup_flight_fare(llm, origin_city, destination_city, dates, currency, search_tool):
+    """Return a round-trip economy fare per person in the destination currency.
+
+    Google Flights (exact dates, non-stop preferred) is the primary source. If it can't be read, the web
+    search + LLM extraction below is used as a fallback, where the LLM only extracts the quoted amount and
+    currency; doubling a one-way fare and currency conversion (live exchange rate) are done in code.
     Returns {"airline", "fare_pp", "currency", "basis"} or None when no usable fare is found."""
+    google_fare = _google_flights_fare(origin_city, destination_city, dates, currency)
+    if google_fare:
+        return google_fare
     if not (search_tool and origin_city and destination_city):
         return None
     try:
