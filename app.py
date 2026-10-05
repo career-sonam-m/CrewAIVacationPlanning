@@ -15,7 +15,6 @@ Run this app using:
 import warnings
 warnings.filterwarnings('ignore')
 import os
-import sys
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import streamlit as st
@@ -229,7 +228,7 @@ if __name__ == "__main__":
         st.markdown(render_section_header("Vacation Specifications", icon="📍", subtitle="Enter trip details"), unsafe_allow_html=True)
         # Show prominent warning if OpenAI key is not present so users notice immediately
         if not default_openai_api_key:
-            st.warning("OpenAI API key not found. The 'Generate Vacation Plan' button requires an API key to run the planner. You can still run an offline demo using the 'Run Default Demo' button.")
+            st.warning("OpenAI API key not found. The 'Generate Vacation Plan' button requires an API key to run the planner.")
         
         with st.form("planning_form"):
             # Source & Target Destination Inputs stacked cleanly for readability
@@ -301,30 +300,6 @@ if __name__ == "__main__":
         if not openai_api_key:
             # Provide clearer guidance and an offline demo fallback
             st.error("⚠️ **OpenAI API Key missing!** Set `OPENAI_API_KEY` in a `.env` file to run the planner.")
-            if st.button("Run a quick offline demo instead (no API required)"):
-                # Create a lightweight demo plan so the UI shows results without calling APIs
-                demo_plan = {
-                    "enhanced_goal": f"Demo plan for {destination_city}",
-                    "enhanced_dates": dates,
-                    "enhanced_family": family_size,
-                    "enhanced_preferences": preferences,
-                    "currency": "USD",
-                    "currency_symbol": "$",
-                    "result": f"Demo generated plan for {destination_city}.\n\n## Money Saving Tips\n1) Book early...",
-                    "sources": [],
-                    "extracted_budget": {
-                        "flight_pp": 400.0,
-                        "hotel_pn": 150.0,
-                        "food_ppd": 50.0,
-                        "activities": 200.0,
-                        "transport": 80.0,
-                        "num_adults": 2,
-                        "num_children": 0,
-                        "num_days": 7
-                    }
-                }
-                st.session_state.plan_result = demo_plan
-                st.experimental_rerun()
         else:
             vacation_goal = f"Plan trip from {origin_city} to {destination_city}. {vacation_goal_input}" if origin_city else f"Plan trip to {destination_city}. {vacation_goal_input}"
             trigger_execution = True

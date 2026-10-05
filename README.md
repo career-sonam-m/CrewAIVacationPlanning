@@ -6,6 +6,8 @@ It creates personalized trip plans, day-by-day itineraries, local-currency budge
 
 ## Features
 - **4-Agent CrewAI Workflow**: Operates sequentially and concurrently to research, map schedules, and tally itemized pricing.
+- **Live Price Lookups (no hardcoded prices)**: Round-trip flight fare and hotel, food, transport and attraction benchmarks come from Tavily web search. An LLM only extracts the quoted amount, and code handles one-way doubling and conversion into the destination currency using a live exchange rate (open.er-api.com). Results are injected into the agent prompts.
+- **Fare Verification Warning**: The Recommended Flight box shows a warning when the fare is not backed by a live search.
 - **Dynamic Google Flights Link**: Automatically parses your source city, destination, and selected travel dates to compile exact, live round-trip flight booking routes.
 - **Safe Evaluation Sandbox**: Safe AST-evaluation logic (A03 Injection Protected) for error-free math calculations.
 - **Strict Budget Consistency**: Programmatic schema assertions to ensure per-person and total day metrics are perfectly matched.
@@ -54,4 +56,8 @@ Set these in `.env` to tune the planner:
 If a run ends with "Agent stopped due to iteration limit or time limit", raise the last two values.
 
 ## Caching
-Results are cached as JSON in `.vacation_cache/`, keyed by the trip inputs. Delete that folder to force a fresh plan for the same inputs.
+Results are cached as JSON in `.vacation_cache/`, keyed by the trip inputs (not the code version). Delete the JSON files there to force a fresh plan, especially after changing code.
+
+## Notes
+- Live lookups need `TAVILY_API_KEY`. Without it, or if a lookup or exchange-rate call fails, the agents' own estimates are used and flagged as unverified.
+- Price benchmarks come from single search snippets, so treat them as indicative.

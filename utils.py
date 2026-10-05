@@ -68,12 +68,6 @@ def get_currency_symbol(currency_str: str) -> str:
     return currency_str.strip()
 
 
-def format_currency_amount(amount: float, symbol: str = "₹") -> str:
-    """Format monetary float into formatted string with currency symbol and commas."""
-    sym = symbol or "₹"
-    return f"{sym}{amount:,.0f}"
-
-
 def validate_and_adjust_dates(date_str: str) -> str:
     """Validate that travel dates are in the future relative to the current date.
     Adjusts them if needed while preserving the duration of the trip."""

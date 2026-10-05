@@ -10,7 +10,6 @@ This module defines the CrewAI multi-agent system including:
 """
 
 import os
-import sys
 import hashlib
 import json
 from pathlib import Path
@@ -266,7 +265,6 @@ class TrackedTavilySearchTool(BaseTool):
 
     def _run(self, query: str) -> str:
         """Perform a Tavily search and capture source URLs before returning results."""
-        global _active_search_sources
         try:
             from tavily import TavilyClient
             api_key = os.environ.get("TAVILY_API_KEY", "")
@@ -412,6 +410,174 @@ def validate_destination_quick(vacation_goal, api_key):
 
 
 # ---------------------------------------------------------------------------
+# Live flight fare lookup (web search + LLM extraction, no hardcoded price ranges)
+# ---------------------------------------------------------------------------
+
+def lookup_flight_fare(llm, origin_city, destination_city, dates, currency, search_tool):
+    """Search the web for a flight fare and return a round-trip economy fare in the destination currency.
+
+    The LLM only extracts the quoted amount, currency and trip type from search results; doubling a
+    one-way fare and the currency conversion (live exchange rate) are done in code.
+    Returns {"airline", "fare_pp", "currency", "basis"} or None when no usable fare is found."""
+    if not (search_tool and origin_city and destination_city):
+        return None
+    try:
+        query = (
+            f"{origin_city} to {destination_city} round trip economy flight fare per person "
+            f"price {dates}"
+        )
+        search_text = search_tool._run(query)
+        if not search_text or search_text.startswith(("Search failed", "No Tavily", "No results")):
+            return None
+
+        prompt = (
+            "Extract ONE quoted flight fare from the search results below. Do not use your own knowledge "
+            "of prices and do not do any arithmetic or currency conversion.\n"
+            f"Route: {origin_city} to {destination_city} (either direction is fine). Travel dates: {dates}.\n\n"
+            "Rules:\n"
+            "- Use only a TOTAL fare explicitly shown for this route in economy class. Ignore fees "
+            "(cancellation/date change/baggage), 'Base Fare', 'Surcharges', and other routes.\n"
+            "- Choose the lowest representative economy total. Fares for other dates are acceptable.\n"
+            "- trip_type is 'round-trip' ONLY if the source explicitly says round trip/return for that price; "
+            "otherwise use 'one-way'.\n"
+            "- currency_code is the ISO code of the currency the amount is quoted in (e.g. INR, EUR, USD).\n"
+            "- If no usable fare is stated, return null for amount.\n\n"
+            'Return ONLY JSON: {"airline": "<airline name or null>", "amount": <number or null>, '
+            '"currency_code": "<ISO code>", "trip_type": "one-way" or "round-trip"}\n\n'
+            f"SEARCH RESULTS:\n{search_text[:8000]}"
+        )
+        raw = llm.invoke(prompt).content
+        found = re.search(r"\{.*\}", raw, re.DOTALL)
+        data = json.loads(found.group(0)) if found else {}
+        amount = data.get("amount")
+        src_code = str(data.get("currency_code") or "").strip().upper()
+        if not (isinstance(amount, (int, float)) and amount > 0 and re.fullmatch(r"[A-Z]{3}", src_code)):
+            return None
+
+        target_code = (re.match(r"\s*([A-Za-z]{3})", currency or "") or [None, ""])[1].upper()
+        if not target_code:
+            return None
+
+        round_trip = data.get("trip_type") == "round-trip"
+        fare = float(amount) if round_trip else float(amount) * 2
+        rate = 1.0
+        if src_code != target_code:
+            rate = _get_exchange_rate(src_code, target_code)
+            if not rate:
+                return None
+        basis = (
+            f"{src_code} {amount:,.0f} quoted {'round-trip' if round_trip else 'one-way (doubled for round-trip)'}"
+            + (f", converted at 1 {src_code} = {rate:.4f} {target_code}" if src_code != target_code else "")
+            + "."
+        )
+        return {
+            "airline": data.get("airline") or None,
+            "fare_pp": round(fare * rate, 2),
+            "currency": currency,
+            "basis": basis,
+        }
+    except Exception:
+        pass
+    return None
+
+
+def _get_exchange_rate(from_code, to_code):
+    """Fetch a live exchange rate (no API key needed). Returns None if unavailable."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"https://open.er-api.com/v6/latest/{from_code}", timeout=8) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        rate = payload.get("rates", {}).get(to_code)
+        return float(rate) if rate else None
+    except Exception:
+        return None
+
+
+# Cost categories researched live. Each entry: (label, unit description, search phrase).
+# Only unit definitions live here; every price comes from web search results.
+_COST_CATEGORIES = {
+    "hotel_pn": (
+        "Accommodation", "per night for one standard double room (mid-range hotel)",
+        "mid-range hotel price per night"
+    ),
+    "food_ppd": (
+        "Food & dining", "per person per day for all meals at typical restaurants",
+        "average daily food cost per person restaurant meals"
+    ),
+    "transport_ppd": (
+        "Local transport", "per person per day for local public transport or taxis",
+        "local public transport day pass taxi cost"
+    ),
+    "activity_pp": (
+        "Attractions", "per person per typical major attraction ticket",
+        "main tourist attractions ticket prices"
+    ),
+}
+
+
+def lookup_cost_benchmark(llm, key, destination_city, dates, currency, search_tool):
+    """Live-search one cost category at the destination and return it in the destination currency.
+
+    The LLM only extracts the quoted amount and currency from search results; the conversion uses a
+    live exchange rate in code. Returns {"label","unit","amount","basis"} or None."""
+    if not (search_tool and destination_city and key in _COST_CATEGORIES):
+        return None
+    label, unit, phrase = _COST_CATEGORIES[key]
+    try:
+        search_text = search_tool._run(f"{destination_city} {phrase} {dates}")
+        if not search_text or search_text.startswith(("Search failed", "No Tavily", "No results")):
+            return None
+
+        prompt = (
+            f"Extract ONE typical {label.lower()} price for {destination_city} from the search results below. "
+            "Do not use your own knowledge of prices and do not do any arithmetic or currency conversion.\n"
+            f"Required unit: {unit}.\n\n"
+            "Rules:\n"
+            "- Use only an amount explicitly stated in the results in exactly this unit (or a range, in which "
+            "case return its midpoint as quoted midpoint only if both ends are stated).\n"
+            "- currency_code is the ISO code of the currency the amount is quoted in (e.g. USD, EUR, INR).\n"
+            "- If no amount in this unit is stated, return null for amount.\n\n"
+            'Return ONLY JSON: {"amount": <number or null>, "currency_code": "<ISO code>"}\n\n'
+            f"SEARCH RESULTS:\n{search_text[:8000]}"
+        )
+        raw = llm.invoke(prompt).content
+        found = re.search(r"\{.*\}", raw, re.DOTALL)
+        data = json.loads(found.group(0)) if found else {}
+        amount = data.get("amount")
+        src_code = str(data.get("currency_code") or "").strip().upper()
+        if not (isinstance(amount, (int, float)) and amount > 0 and re.fullmatch(r"[A-Z]{3}", src_code)):
+            return None
+
+        target_code = (re.match(r"\s*([A-Za-z]{3})", currency or "") or [None, ""])[1].upper()
+        if not target_code:
+            return None
+        rate = 1.0
+        if src_code != target_code:
+            rate = _get_exchange_rate(src_code, target_code)
+            if not rate:
+                return None
+        basis = f"{src_code} {amount:,.2f} quoted" + (
+            f", converted at 1 {src_code} = {rate:.4f} {target_code}" if src_code != target_code else ""
+        )
+        return {"label": label, "unit": unit, "amount": round(float(amount) * rate, 2), "basis": basis}
+    except Exception:
+        return None
+
+
+def lookup_cost_benchmarks(llm, destination_city, dates, currency, search_tool):
+    """Run all category lookups concurrently. Returns {key: benchmark} for the ones found."""
+    if not (search_tool and destination_city):
+        return {}
+    from concurrent.futures import ThreadPoolExecutor
+    keys = list(_COST_CATEGORIES)
+    with ThreadPoolExecutor(max_workers=len(keys)) as pool:
+        results = list(pool.map(
+            lambda k: lookup_cost_benchmark(llm, k, destination_city, dates, currency, search_tool), keys
+        ))
+    return {k: r for k, r in zip(keys, results) if r}
+
+
+# ---------------------------------------------------------------------------
 # CrewAI Multi-Agent Vacation Planner
 # ---------------------------------------------------------------------------
 
@@ -550,6 +716,37 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
             "re-infer this from the dates or from any wording elsewhere in the goal text.\n"
         )
 
+        # Look up a live round-trip fare in the destination currency so agents don't guess it
+        live_fare = lookup_flight_fare(
+            llm_direct, origin_city, destination_city, enhanced_dates, detected_currency, web_search_tool
+        )
+        flight_fare_line = ""
+        if live_fare:
+            airline_hint = f" on {live_fare['airline']}" if live_fare["airline"] else ""
+            flight_fare_line = (
+                f"VERIFIED LIVE FLIGHT FARE (from web search): {currency_symbol}{live_fare['fare_pp']:,.2f} "
+                f"({detected_currency}) per person, round-trip economy{airline_hint}. "
+                f"Basis: {live_fare['basis']} "
+                "Use this EXACT per-person fare for all flight calculations, for the flight section, and for "
+                "flight_pp in the JSON export. Express EVERY amount in "
+                f"{detected_currency}; never copy amounts in any other currency (such as INR) from search results.\n"
+            )
+
+        cost_benchmarks = lookup_cost_benchmarks(
+            llm_direct, destination_city, enhanced_dates, detected_currency, web_search_tool
+        )
+        if cost_benchmarks:
+            flight_fare_line += (
+                "VERIFIED LIVE PRICE BENCHMARKS (from web search, already in "
+                f"{detected_currency}). Base your estimates on these figures and scale them to the "
+                "travel party (rooms needed, number of travelers, trip days); only deviate when the research "
+                "findings show a clearly better-sourced figure, and say so:\n"
+                + "".join(
+                    f"- {b['label']}: {currency_symbol}{b['amount']:,.2f} {b['unit']} ({b['basis']})\n"
+                    for b in cost_benchmarks.values()
+                )
+            )
+
         # ==================================================================
         # MAIN CREW PHASE — CrewAI Multi-Agent Architecture
         # ==================================================================
@@ -658,6 +855,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 f"FLIGHT ROUTE: {flight_route} (round-trip)\n"
                 f"Dates: {enhanced_dates}\n"
                 f"{trip_duration_line}"
+                f"{flight_fare_line}"
                 f"Travel party: {enhanced_family}\n"
                 f"Preferences: {preferences}\n\n"
                 "DYNAMIC PRICING INSTRUCTIONS:\n"
@@ -667,7 +865,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "4. Compare realistic price ranges for different booking windows\n\n"
                 "Provide DIVERSE and SPECIFIC recommendations:\n"
                 f"- 2 flight options for the EXACT route {flight_route} (round-trip):\n"
-                "  * Option 1: Budget airline — NAME THE SPECIFIC AIRLINE (e.g. IndiGo, Ryanair, AirAsia)\n"
+                "  * Option 1: Budget airline — NAME THE SPECIFIC AIRLINE\n"
                 "  * Option 2: Full-service carrier — NAME THE SPECIFIC AIRLINE (e.g. Air India, Lufthansa, Emirates)\n"
                 "  * For EACH option: state airline name, whether direct or connecting, flight duration, "
                 "and estimated round-trip fare per person based on travel dates and seasonality\n"
@@ -732,13 +930,14 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 f"FLIGHT ROUTE: {flight_route} (round-trip)\n"
                 f"Dates: {enhanced_dates}\n"
                 f"{trip_duration_line}"
+                f"{flight_fare_line}"
                 f"Travel party: {enhanced_family}\n"
                 f"Preferences: {preferences}\n\n"
                 "Use the research findings from the Research Specialist.\n"
                 "CRITICAL: Use your Calculator tool for all math calculations (multiplication of rates, summing categories, contingency percentage).\n\n"
                 "FLIGHT COSTS:\n"
                 f"1. The flight route is: {flight_route} (round-trip). Use this EXACT route for pricing.\n"
-                "2. Name the SPECIFIC AIRLINE(S) for each option (e.g. Air India, Emirates, IndiGo).\n"
+                "2. Name the SPECIFIC AIRLINE(S) for each option.\n"
                 "3. Determine a realistic economy class ROUND-TRIP fare per person for this specific route, using the "
                 "fares found in the research findings. Never use a one-way fare; do not go below the lowest round-trip "
                 "fare found in the research unless a cited source supports it.\n"
@@ -751,10 +950,8 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "- Based on party size, determine number of rooms required.\n"
                 "- Calculate using Calculator tool: [nightly rate] × [rooms] × [nights] = Total accommodation cost.\n\n"
                 "FOOD & DINING:\n"
-                "- Estimate daily food spend per person based on destination cost of living.\n"
-                "- REALISM CHECK: food for a mid-range traveler is typically 30-60 EUR (or the equivalent in local currency) "
-                "per person per day in Western Europe/US/Japan, and lower only in low-cost destinations. Never budget below "
-                "the local equivalent of 25 EUR per person per day for developed destinations.\n"
+                "- Estimate daily food spend per person from the live benchmark above when provided, otherwise "
+                "from search results for this destination's cost of living.\n"
                 "- Calculate using Calculator tool: [daily food cost] × [people] × [days] = Total food cost.\n\n"
                 "ACTIVITIES & LOCAL TRANSPORT:\n"
                 "- Use attraction ticket prices from research for the specific party composition.\n"
@@ -782,6 +979,7 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "Assemble the FINAL travel plan from all agent outputs.\n\n"
                 f"Travel Dates: {enhanced_dates}\n"
                 f"{trip_duration_line}"
+                f"{flight_fare_line}"
                 f"Current Date (Today): {current_date_str}\n\n"
                 "CRITICAL INSTRUCTIONS FOR FINAL OUTPUT:\n"
                 f"1. ALL currency amounts must use LOCAL CURRENCY ({detected_currency}) with symbol ({currency_symbol})\n"
@@ -852,13 +1050,13 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                     result = result.replace(match.group(0), "").strip()
                 except Exception:
                     pass
-            # Flag fares not backed by any live flight search so the UI can warn the user
+            # Enforce the live-searched fare and flag whether the displayed fare is search-backed
             if extracted_budget and isinstance(extracted_budget, dict):
-                extracted_budget["flight_fare_verified"] = any(
-                    any(k in ((s.get("query") or "") + " " + (s.get("title") or "")).lower()
-                        for k in ("flight", "fare", "airfare", "airline"))
-                    for s in _active_search_sources
-                )
+                if live_fare:
+                    extracted_budget["flight_pp"] = live_fare["fare_pp"]
+                    if live_fare["airline"]:
+                        extracted_budget["airline_name"] = live_fare["airline"]
+                extracted_budget["flight_fare_verified"] = bool(live_fare)
             # Construct highly-accurate dynamic search URL based on traveler specification cities and travel dates
             # instead of using generic landing/cached pages which are not for the right dates.
             precise_search_url = ""
@@ -896,33 +1094,13 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 if precise_search_url:
                     flight_src = precise_search_url
                 else:
-                    # Prefer any tracked Tavily source that looks like a reliable flight booking site.
-                    # Safe for BOTH domestic and international departure routes! 
-                    # Avoid matching localized regional crawlers (like /nepal/ templates unless target country is actually Nepal)
-                    preferred_hosts = ["makemytrip.com", "cleartrip.com", "skyscanner.net", "skyscanner.com", "kayak.com", "momondo.com", "google.com"]
                     flight_src = None
                     for src in _active_search_sources:
-                        u = src.get("url", "") or ""
-                        # Safeguard against wrong SEO routing unless Nepal is the actual target/origin
-                        if "/nepal/" in u and "nepal" not in (enhanced_goal.lower() + " " + preferences.lower()):
-                            continue
-                        for h in preferred_hosts:
-                            if h in u:
-                                flight_src = u
-                                break
-                        if flight_src:
+                        q = (src.get("query") or "").lower()
+                        if "flight" in q or "fare" in q or "flight" in (src.get("title") or "").lower():
+                            flight_src = src.get("url")
                             break
-                    # Fallback: if no preferred host, pick first source that mentions flights
-                    if not flight_src:
-                        for src in _active_search_sources:
-                            u = src.get("url", "") or ""
-                            if "/nepal/" in u and "nepal" not in (enhanced_goal.lower() + " " + preferences.lower()):
-                                continue
-                            q = (src.get("query") or "").lower()
-                            if "flight" in q or "fare" in q or "flight" in (src.get("title") or "").lower():
-                                flight_src = src.get("url")
-                                break
-                                
+
                 if flight_src:
                     try:
                         extracted_budget["flight_source"] = flight_src
