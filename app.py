@@ -460,6 +460,11 @@ if __name__ == "__main__":
                         f"**Cost:** {sym}{flight_cost:,.2f} per person (round trip)"
                         f"{link_line}"
                     )
+                    if eb.get("flight_fare_verified") is False:
+                        st.warning(
+                            "⚠️ This fare is an estimate, not backed by a live flight search "
+                            "(add a TAVILY_API_KEY for live data). Please confirm the price on the booking link."
+                        )
 
             # Extract Money Saving Tips from plan
             plan_text = res["result"]

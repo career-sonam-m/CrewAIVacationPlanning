@@ -672,6 +672,11 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "  * For EACH option: state airline name, whether direct or connecting, flight duration, "
                 "and estimated round-trip fare per person based on travel dates and seasonality\n"
                 "  * Calculate total flight cost for the whole party\n"
+                "  * MANDATORY: use the Web Search tool to look up current fares for this exact route and travel dates "
+                "BEFORE quoting any price. Quote only ROUND-TRIP ECONOMY fares. If a source shows a one-way price, "
+                "double it; never present a one-way or promotional teaser fare as the round-trip fare.\n"
+                "  * Long-haul intercontinental round trips (e.g. India to Europe/US) are rarely cheap; if your figure "
+                "looks unusually low for the distance, re-check it with another search\n"
                 "- 2-3 accommodation types with SPECIFIC, UNIQUE hotels/properties:\n"
                 "  * Avoid generic chain hotels when possible\n"
                 "  * Provide options suitable for the composition of the party\n"
@@ -734,7 +739,9 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "FLIGHT COSTS:\n"
                 f"1. The flight route is: {flight_route} (round-trip). Use this EXACT route for pricing.\n"
                 "2. Name the SPECIFIC AIRLINE(S) for each option (e.g. Air India, Emirates, IndiGo).\n"
-                "3. Determine a realistic economy class round-trip fare per person for this specific route.\n"
+                "3. Determine a realistic economy class ROUND-TRIP fare per person for this specific route, using the "
+                "fares found in the research findings. Never use a one-way fare; do not go below the lowest round-trip "
+                "fare found in the research unless a cited source supports it.\n"
                 "4. Factor in the travel season: high season routes command higher prices.\n"
                 "5. Count the total number of travelers. Children aged 2+ require a full paid seat.\n"
                 "6. Calculate using Calculator tool: [per-person fare] × [total travelers] = Total flight cost.\n"
@@ -745,6 +752,9 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                 "- Calculate using Calculator tool: [nightly rate] × [rooms] × [nights] = Total accommodation cost.\n\n"
                 "FOOD & DINING:\n"
                 "- Estimate daily food spend per person based on destination cost of living.\n"
+                "- REALISM CHECK: food for a mid-range traveler is typically 30-60 EUR (or the equivalent in local currency) "
+                "per person per day in Western Europe/US/Japan, and lower only in low-cost destinations. Never budget below "
+                "the local equivalent of 25 EUR per person per day for developed destinations.\n"
                 "- Calculate using Calculator tool: [daily food cost] × [people] × [days] = Total food cost.\n\n"
                 "ACTIVITIES & LOCAL TRANSPORT:\n"
                 "- Use attraction ticket prices from research for the specific party composition.\n"
@@ -842,6 +852,13 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
                     result = result.replace(match.group(0), "").strip()
                 except Exception:
                     pass
+            # Flag fares not backed by any live flight search so the UI can warn the user
+            if extracted_budget and isinstance(extracted_budget, dict):
+                extracted_budget["flight_fare_verified"] = any(
+                    any(k in ((s.get("query") or "") + " " + (s.get("title") or "")).lower()
+                        for k in ("flight", "fare", "airfare", "airline"))
+                    for s in _active_search_sources
+                )
             # Construct highly-accurate dynamic search URL based on traveler specification cities and travel dates
             # instead of using generic landing/cached pages which are not for the right dates.
             precise_search_url = ""
