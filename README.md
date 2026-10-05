@@ -32,6 +32,9 @@ It creates personalized trip plans, day-by-day itineraries, local-currency budge
    ```env
    OPENAI_API_KEY=your_openai_api_key_here
    TAVILY_API_KEY=your_tavily_api_key_here
+   # Optional CrewAI agent limits (defaults: 15 iterations / 300 seconds)
+   PLANNER_MAX_ITER=15
+   PLANNER_MAX_EXEC_TIME=300
    ```
 3. Run locally:
    ```bash

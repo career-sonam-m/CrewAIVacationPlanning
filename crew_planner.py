@@ -475,8 +475,8 @@ def run_vacation_planner(vacation_goal, dates, family_size, preferences, api_key
     # Tunable agent execution parameters to trade speed vs quality
     # NOTE: now that tools are correctly recognized by crewai (see BaseTool import fix),
     # agents actually invoke them (searches, calculations) and need more than 1-2 steps to finish.
-    default_max_iter = int(os.getenv("PLANNER_MAX_ITER", "8"))
-    default_max_exec_time = int(os.getenv("PLANNER_MAX_EXEC_TIME", "120"))
+    default_max_iter = int(os.getenv("PLANNER_MAX_ITER", "15"))
+    default_max_exec_time = int(os.getenv("PLANNER_MAX_EXEC_TIME", "300"))
 
     # Direct LLM for fast pre-flight calls (no Crew overhead)
     llm_direct = ChatOpenAI(model=model_name, temperature=temperature)
